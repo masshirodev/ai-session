@@ -25,6 +25,34 @@ func TestCleanEnvironmentRemovesSharedAuthLocations(t *testing.T) {
 	}
 }
 
+func TestBareProfileInvocationUsesProfileAndArguments(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	path, err := configPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveConfig(path, Config{Profiles: []Profile{{Name: "ka", Provider: "codex", Command: "/bin/echo"}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr strings.Builder
+	if err := run([]string{"ka", "from-profile"}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "from-profile\n" {
+		t.Fatalf("bare profile output = %q, want forwarded argument", stdout.String())
+	}
+}
+
+func TestMissingBareProfileReturnsUsefulError(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	var stdout, stderr strings.Builder
+	err := run([]string{"ka"}, &stdout, &stderr)
+	if err == nil || err.Error() != `unknown command or profile "ka"; try 'ai help'` {
+		t.Fatalf("bare missing profile error = %v", err)
+	}
+}
+
 func TestSaveConfigUsesPrivateAtomicFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nested", "profiles.json")

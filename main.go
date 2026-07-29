@@ -106,7 +106,14 @@ func run(args []string, stdout, stderr io.Writer) error {
 		usage(stdout)
 		return nil
 	default:
-		return fmt.Errorf("unknown command %q; try 'ai help'", args[0])
+		// A profile name is the most useful thing to do with a bare argument.
+		// Keep all named commands above reserved, so this shorthand cannot make
+		// an existing command ambiguous.
+		profile, err := findProfile(cfg, args[0])
+		if err != nil {
+			return fmt.Errorf("unknown command or profile %q; try 'ai help'", args[0])
+		}
+		return launch(profile, args[1:], stdout, stderr)
 	}
 }
 
@@ -573,6 +580,7 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "  ai profile list")
 	fmt.Fprintln(w, "  ai login <profile>")
 	fmt.Fprintln(w, "  ai run <profile> [arguments...]")
+	fmt.Fprintln(w, "  ai <profile> [arguments...]             shorthand for ai run")
 	fmt.Fprintln(w, "  ai env <profile>")
 	fmt.Fprintln(w, "  ai integrate openusage <profile>")
 	fmt.Fprintln(w, "  ai path")

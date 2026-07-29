@@ -53,6 +53,19 @@ ai run claude-personal
 ai run opencode-go
 ```
 
+The `run` command is optional when the first argument is a profile name. These
+are equivalent, and any following arguments are passed to the profile's
+configured command:
+
+```sh
+ai claude-personal
+ai run claude-personal
+ai codex-work exec -- "review this repository"
+```
+
+If the bare argument is not an existing profile, `ai` returns an error instead
+of guessing a provider or creating a profile.
+
 Running `ai` without arguments opens an interactive Bubble Tea TUI. Providers
 are colour-coded, a profile that currently holds its lock is marked
 `▶ running`, and the `AUTH` column shows whether the profile has logged in:
