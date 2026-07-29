@@ -66,6 +66,26 @@ ai codex-work exec -- "review this repository"
 If the bare argument is not an existing profile, `ai` returns an error instead
 of guessing a provider or creating a profile.
 
+## Move a profile to another computer
+
+Install [`age`](https://age-encryption.org/) on both computers, then export the
+profile as an encrypted bundle:
+
+```sh
+ai profile export codex-work codex-work.ai-profile.age
+ai profile import codex-work.ai-profile.age
+```
+
+The export includes only that profile's metadata and isolated CLI state. `age`
+prompts for the encryption passphrase; the launcher never prints or stores it.
+Imports refuse to replace an existing profile. Treat the bundle like a password
+backup and delete it after transferring it if it is no longer needed. API keys
+provided through environment variables, such as `DEEPSEEK_API_KEY`, are not
+included and must be transferred separately through a secret manager.
+
+Do not actively use the same imported profile on multiple computers: provider
+refresh tokens may rotate when used.
+
 Running `ai` without arguments opens an interactive Bubble Tea TUI. Providers
 are colour-coded, a profile that currently holds its lock is marked
 `▶ running`, and the `AUTH` column shows whether the profile has logged in:

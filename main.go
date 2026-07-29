@@ -126,6 +126,22 @@ func profileCommand(args []string, cfg *Config, path string, stdout io.Writer) e
 		}
 		return nil
 	}
+	if args[0] == "export" {
+		if len(args) != 3 {
+			return errors.New("usage: ai profile export <profile> <bundle.age>")
+		}
+		profile, err := findProfile(*cfg, args[1])
+		if err != nil {
+			return err
+		}
+		return exportProfile(profile, args[2], stdout)
+	}
+	if args[0] == "import" {
+		if len(args) != 2 {
+			return errors.New("usage: ai profile import <bundle.age>")
+		}
+		return importProfile(args[1], cfg, path, stdout)
+	}
 	if args[0] != "add" || len(args) < 3 || len(args) > 4 {
 		return errors.New("usage: ai profile add <name> <provider> [command]")
 	}
@@ -578,6 +594,8 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "  ai                                      interactive profile TUI")
 	fmt.Fprintln(w, "  ai profile add <name> <provider> [command]")
 	fmt.Fprintln(w, "  ai profile list")
+	fmt.Fprintln(w, "  ai profile export <profile> <bundle.age>")
+	fmt.Fprintln(w, "  ai profile import <bundle.age>")
 	fmt.Fprintln(w, "  ai login <profile>")
 	fmt.Fprintln(w, "  ai run <profile> [arguments...]")
 	fmt.Fprintln(w, "  ai <profile> [arguments...]             shorthand for ai run")
