@@ -53,8 +53,39 @@ ai run claude-personal
 ai run opencode-go
 ```
 
-Running `ai` without arguments opens an interactive Bubble Tea TUI. Use the
-arrow keys or `j`/`k` to select a profile:
+Running `ai` without arguments opens an interactive Bubble Tea TUI. Providers
+are colour-coded, a profile that currently holds its lock is marked
+`▶ running`, and the `AUTH` column shows whether the profile has logged in:
+
+- `● yes` — the provider's credential file exists in the isolated state
+  directory, so `ai run` can use it.
+- `● key` — a `deepseek` profile with `DEEPSEEK_API_KEY` exported. DeepSeek runs
+  through OpenCode with an API key from the environment rather than a stored
+  credential file, so there is nothing to log in to.
+- `○ no` — no credentials yet; press `l` to log in.
+- `· ?` — the provider has no known credential location, so the launcher does
+  not guess.
+
+The `MODEL` column shows the model the profile will start with, read from that
+CLI's own settings inside the isolated directory. `—` means the provider has no
+discoverable answer yet:
+
+| Provider | Source |
+| -------- | ------ |
+| Codex | `codex/config.toml`, top-level `model` |
+| Claude Code | `claude/settings.json`, `model` |
+| OpenCode | `state/opencode/model.json`, most recent entry; falls back to `model` in `config/opencode/opencode.json[c]` |
+
+OpenCode's state file is preferred because it holds the model last chosen in the
+TUI, which is what OpenCode restores on the next start; the config default only
+applies before anything has been picked.
+
+The check only tests whether the file exists, and reads the API key variable
+only to see whether it is empty; `ai-session` still never opens or prints
+credentials. A profile whose token has expired therefore keeps showing `● yes`
+until the official CLI asks you to log in again.
+
+Use the arrow keys or `j`/`k` to select a profile:
 
 - Enter runs the selected profile.
 - `l` logs in to the selected profile.

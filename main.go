@@ -12,7 +12,11 @@ import (
 	"strings"
 )
 
-const appName = "ai"
+const (
+	appName = "ai"
+	// deepSeekKeyEnv is the API key OpenCode reads for the DeepSeek provider.
+	deepSeekKeyEnv = "DEEPSEEK_API_KEY"
+)
 
 type Profile struct {
 	Name     string `json:"name"`
@@ -234,6 +238,193 @@ func profileEnv(profile Profile) []string {
 	default:
 		return nil
 	}
+}
+
+type authState int
+
+const (
+	authUnknown authState = iota
+	authMissing
+	authPresent
+	authAPIKey
+)
+
+// profileAuthState reports whether a profile has credentials by testing only
+// for the presence of the credential file each CLI writes inside the isolated
+// state directory set up by profileEnv. Contents are never opened, so this
+// answers "has this profile logged in at least once", not "is the token still
+// valid" — an expired token still reads as present.
+func profileAuthState(profile Profile) authState {
+	root, err := profileRoot()
+	if err != nil {
+		return authUnknown
+	}
+	dir := filepath.Join(root, profile.Name)
+	var candidates []string
+	switch profile.Provider {
+	case "codex":
+		candidates = []string{filepath.Join(dir, "codex", "auth.json")}
+	case "claude":
+		candidates = []string{filepath.Join(dir, "claude", ".credentials.json")}
+	case "opencode":
+		candidates = []string{filepath.Join(dir, "data", "opencode", "auth.json")}
+	case "deepseek":
+		// DeepSeek runs through OpenCode but authenticates with an API key
+		// taken from the environment, so there is no per-profile credential
+		// file to look for.
+		if os.Getenv(deepSeekKeyEnv) != "" {
+			return authAPIKey
+		}
+		return authMissing
+	default:
+		return authUnknown
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			return authPresent
+		}
+	}
+	return authMissing
+}
+
+// profileModel reports the model a profile will use on its next launch, or an
+// empty string when the provider offers no discoverable answer. Only each CLI's
+// own settings and state files are read — never a credential file — so this
+// stays inside the promise that ai-session does not open stored tokens.
+func profileModel(profile Profile) string {
+	root, err := profileRoot()
+	if err != nil {
+		return ""
+	}
+	dir := filepath.Join(root, profile.Name)
+	switch profile.Provider {
+	case "codex":
+		return tomlTopLevelString(filepath.Join(dir, "codex", "config.toml"), "model")
+	case "claude":
+		return jsonModelField(filepath.Join(dir, "claude", "settings.json"))
+	case "opencode":
+		// The state file records the model last picked in the TUI, which is what
+		// OpenCode restores on start; the config default only applies until then.
+		if model := openCodeRecentModel(filepath.Join(dir, "state", "opencode", "model.json")); model != "" {
+			return model
+		}
+		for _, name := range []string{"opencode.json", "opencode.jsonc"} {
+			if model := jsonModelField(filepath.Join(dir, "config", "opencode", name)); model != "" {
+				return model
+			}
+		}
+	}
+	return ""
+}
+
+// tomlTopLevelString reads one quoted top-level key without a TOML parser.
+// Scanning stops at the first table header so a same-named key inside a
+// [section] cannot be mistaken for the global setting.
+func tomlTopLevelString(path, key string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "[") {
+			break
+		}
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		name, value, found := strings.Cut(line, "=")
+		if !found || strings.TrimSpace(name) != key {
+			continue
+		}
+		return strings.Trim(strings.TrimSpace(value), `"'`)
+	}
+	return ""
+}
+
+func jsonModelField(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var settings struct {
+		Model string `json:"model"`
+	}
+	if err := json.Unmarshal(sanitizeJSONC(data), &settings); err != nil {
+		return ""
+	}
+	return settings.Model
+}
+
+func openCodeRecentModel(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	var state struct {
+		Recent []struct {
+			ProviderID string `json:"providerID"`
+			ModelID    string `json:"modelID"`
+		} `json:"recent"`
+	}
+	if err := json.Unmarshal(data, &state); err != nil || len(state.Recent) == 0 {
+		return ""
+	}
+	recent := state.Recent[0]
+	if recent.ModelID == "" {
+		return ""
+	}
+	if recent.ProviderID == "" {
+		return recent.ModelID
+	}
+	return recent.ProviderID + "/" + recent.ModelID
+}
+
+// sanitizeJSONC strips the comments and trailing commas that OpenCode accepts
+// in opencode.jsonc so encoding/json can read it. Bytes inside string literals
+// are copied through untouched, keeping values such as URLs intact.
+func sanitizeJSONC(data []byte) []byte {
+	out := make([]byte, 0, len(data))
+	var inString, escaped bool
+	for index := 0; index < len(data); index++ {
+		char := data[index]
+		if inString {
+			out = append(out, char)
+			switch {
+			case escaped:
+				escaped = false
+			case char == '\\':
+				escaped = true
+			case char == '"':
+				inString = false
+			}
+			continue
+		}
+		switch {
+		case char == '"':
+			inString = true
+		case char == '/' && index+1 < len(data) && data[index+1] == '/':
+			for index < len(data) && data[index] != '\n' {
+				index++
+			}
+			continue
+		case char == '/' && index+1 < len(data) && data[index+1] == '*':
+			for index += 2; index+1 < len(data) && !(data[index] == '*' && data[index+1] == '/'); index++ {
+			}
+			index++
+			continue
+		case char == ',':
+			next := index + 1
+			for next < len(data) && (data[next] == ' ' || data[next] == '\t' || data[next] == '\n' || data[next] == '\r') {
+				next++
+			}
+			if next < len(data) && (data[next] == '}' || data[next] == ']') {
+				continue
+			}
+		}
+		out = append(out, char)
+	}
+	return out
 }
 
 func ensureProfileState(profile Profile) (string, error) {
