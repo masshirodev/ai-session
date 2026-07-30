@@ -3,11 +3,14 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -19,6 +22,7 @@ const (
 	tuiList tuiMode = iota
 	tuiForm
 	tuiConfirmDelete
+	tuiConfirmKill
 )
 
 type profileForm struct {
@@ -99,6 +103,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateForm(msg)
 		case tuiConfirmDelete:
 			return m.updateDelete(msg)
+		case tuiConfirmKill:
+			return m.updateKill(msg)
 		}
 	case processFinishedMsg:
 		m.running = false
@@ -143,6 +149,15 @@ func (m tuiModel) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.mode = tuiConfirmDelete
 			m.clearStatus()
 		}
+	case "K":
+		if len(m.profiles) > 0 {
+			profile := m.profiles[m.cursor]
+			if !profileIsRunning(profile) {
+				return m, nil
+			}
+			m.mode = tuiConfirmKill
+			m.clearStatus()
+		}
 	case "l":
 		if len(m.profiles) > 0 {
 			return m, m.execProfile(m.profiles[m.cursor], loginArgs(m.profiles[m.cursor].Provider))
@@ -151,6 +166,28 @@ func (m tuiModel) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.profiles) > 0 {
 			return m, m.execProfile(m.profiles[m.cursor], nil)
 		}
+	}
+	return m, nil
+}
+
+func (m tuiModel) updateKill(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y", "Y", "enter":
+		profile := m.profiles[m.cursor]
+		if err := terminateProfile(profile); err != nil {
+			var staleErr staleProfileLockError
+			if errors.As(err, &staleErr) {
+				m.setStatus(statusOK, staleErr.Error())
+			} else {
+				m.setStatus(statusErr, "stop failed: "+err.Error())
+			}
+		} else {
+			m.setStatus(statusOK, "stopped "+profile.Name)
+		}
+		m.mode = tuiList
+	case "n", "N", "esc", "q":
+		m.mode = tuiList
+		m.clearStatus()
 	}
 	return m, nil
 }
@@ -335,9 +372,29 @@ func (m *tuiModel) execProfile(profile Profile, args []string) tea.Cmd {
 	cmd.Env = append(cleanEnvironment(os.Environ()), profileEnv(profile)...)
 	m.running = true
 	m.unlock = unlock
-	return tea.ExecProcess(cmd, func(err error) tea.Msg {
+	return tea.Exec(trackedExecCommand{cmd: cmd, workdir: workdir}, func(err error) tea.Msg {
 		return processFinishedMsg{err: err}
 	})
+}
+
+type trackedExecCommand struct {
+	cmd     *exec.Cmd
+	workdir string
+}
+
+func (c trackedExecCommand) SetStdin(reader io.Reader)  { c.cmd.Stdin = reader }
+func (c trackedExecCommand) SetStdout(writer io.Writer) { c.cmd.Stdout = writer }
+func (c trackedExecCommand) SetStderr(writer io.Writer) { c.cmd.Stderr = writer }
+func (c trackedExecCommand) Run() error {
+	if err := c.cmd.Start(); err != nil {
+		return err
+	}
+	if err := setProfileChildPID(c.workdir, c.cmd.Process.Pid); err != nil {
+		_ = c.cmd.Process.Kill()
+		_ = c.cmd.Wait()
+		return err
+	}
+	return c.cmd.Wait()
 }
 
 func (m tuiModel) View() string {
@@ -485,12 +542,21 @@ func (m tuiModel) confirmView(width int) string {
 		return ""
 	}
 	profile := m.profiles[m.cursor]
-	body := lipgloss.JoinVertical(lipgloss.Left,
+	var body string
+	if m.mode == tuiConfirmKill {
+		body = dangerPanelStyle.Width(width - 2).Render(lipgloss.JoinVertical(lipgloss.Left,
+			dangerTextStyle.Render("Stop "+profile.Name+"?"),
+			confirmBodyStyle.Render("The running CLI process will be terminated."),
+		))
+		return "\n" + body + "\n"
+	}
+	content := lipgloss.JoinVertical(lipgloss.Left,
 		dangerTextStyle.Render("Delete "+profile.Name+"?"),
 		confirmBodyStyle.Render("Its isolated state directory and stored credentials"),
 		confirmBodyStyle.Render("are removed. This cannot be undone."),
 	)
-	return "\n" + dangerPanelStyle.Width(width-2).Render(body) + "\n"
+	body = dangerPanelStyle.Width(width - 2).Render(content)
+	return "\n" + body + "\n"
 }
 
 // helpView wraps at the content width so the key list reflows instead of
@@ -510,6 +576,8 @@ func (m tuiModel) helpEntries() string {
 		})
 	case tuiConfirmDelete:
 		return renderHelp([]helpEntry{{"y", "delete"}, {"n/esc", "keep"}})
+	case tuiConfirmKill:
+		return renderHelp([]helpEntry{{"y/enter", "stop"}, {"n/esc", "keep running"}})
 	default:
 		if len(m.profiles) == 0 {
 			return renderHelp([]helpEntry{{"a", "add profile"}, {"q", "quit"}})
@@ -520,6 +588,7 @@ func (m tuiModel) helpEntries() string {
 			{"a", "add"},
 			{"e", "edit"},
 			{"x", "delete"},
+			{"K", "stop"},
 			{"q", "quit"},
 		})
 	}
@@ -548,6 +617,59 @@ func profileIsRunning(profile Profile) bool {
 	}
 	_, err = os.Stat(filepath.Join(root, profile.Name, ".active.lock"))
 	return err == nil
+}
+
+func terminateProfile(profile Profile) error {
+	root, err := profileRoot()
+	if err != nil {
+		return err
+	}
+	workdir := filepath.Join(root, profile.Name)
+	lockPath := filepath.Join(workdir, ".active.lock")
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		return err
+	}
+	lines := strings.Fields(string(data))
+	if len(lines) == 0 {
+		return errors.New("profile lock is empty")
+	}
+	pidText := lines[0]
+	if len(lines) >= 2 {
+		pidText = lines[1]
+	}
+	pid, err := strconv.Atoi(pidText)
+	if err != nil || pid <= 0 {
+		return errors.New("profile lock has an invalid process PID")
+	}
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return err
+	}
+	if err := process.Signal(syscall.Signal(0)); errors.Is(err, syscall.ESRCH) {
+		if removeErr := os.Remove(lockPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return removeErr
+		}
+		return staleProfileLockError{pid: pid}
+	}
+	if err := process.Kill(); err != nil {
+		if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
+			if removeErr := os.Remove(lockPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+				return removeErr
+			}
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+type staleProfileLockError struct {
+	pid int
+}
+
+func (e staleProfileLockError) Error() string {
+	return fmt.Sprintf("cleared stale profile lock (process %d is not running)", e.pid)
 }
 
 func sortedProfiles(profiles []Profile) []Profile {

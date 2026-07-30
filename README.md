@@ -154,3 +154,7 @@ It runs OpenUsage's supported installer with the selected profile environment,
 so Codex and Claude hooks are installed beside that profile's own state. The
 profile lock also refuses a second process for the same account, preventing
 concurrent refresh-token rotation. Different profiles can still run at once.
+In the TUI, select a running profile and press `K` to confirm termination of
+its CLI process. The lock records the launcher PID on its first line and the
+child CLI PID on its second line; an orphaned lock can therefore be cleared
+from the same action after an interrupted SSH session.

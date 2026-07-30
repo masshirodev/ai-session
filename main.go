@@ -183,17 +183,12 @@ func launchExternal(command string, args []string, profile Profile, stdout, stde
 	if err != nil {
 		return err
 	}
-	unlock, err := acquireProfileLock(workdir)
-	if err != nil {
-		return err
-	}
-	defer unlock()
 	cmd := exec.Command(command, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.Env = append(cleanEnvironment(os.Environ()), profileEnv(profile)...)
-	return cmd.Run()
+	return runLockedCommand(cmd, workdir)
 }
 
 func acquireProfileLock(workdir string) (func(), error) {
@@ -215,6 +210,31 @@ func acquireProfileLock(workdir string) (func(), error) {
 		return nil, err
 	}
 	return func() { _ = os.Remove(lockPath) }, nil
+}
+
+// setProfileChildPID records the process that owns the profile's CLI state.
+// The first line remains the launcher PID for compatibility with older locks;
+// the second line is the child PID that the TUI may terminate.
+func setProfileChildPID(workdir string, pid int) error {
+	lockPath := filepath.Join(workdir, ".active.lock")
+	return os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n%d\n", os.Getpid(), pid)), 0600)
+}
+
+func runLockedCommand(cmd *exec.Cmd, workdir string) error {
+	unlock, err := acquireProfileLock(workdir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	if err := setProfileChildPID(workdir, cmd.Process.Pid); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return err
+	}
+	return cmd.Wait()
 }
 
 func openUsageIntegration(provider string) string {
