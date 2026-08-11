@@ -4,9 +4,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-
-	"github.com/charmbracelet/lipgloss"
 	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 func testProfiles() []Profile {
@@ -18,9 +19,20 @@ func testProfiles() []Profile {
 
 func TestViewListsProfilesWithHelp(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
-	m := tuiModel{profiles: testProfiles(), width: 80, cursor: 1}
+	profiles := testProfiles()
+	profiles[1].DefaultArgs = []string{"--search"}
+	profiles[1].Notes = "work subscription"
+	m := tuiModel{
+		profiles: profiles,
+		width:    80,
+		cursor:   1,
+		usage: map[string]usageRemaining{"codex-work": {
+			FiveHour: usageWindow{Percent: 56, Known: true},
+			Weekly:   usageWindow{Percent: 73, Known: true},
+		}},
+	}
 	view := m.View()
-	for _, want := range []string{"session profiles", "2 profiles", "claude-personal", "codex-work", "run", "login", "quit"} {
+	for _, want := range []string{"session profiles", "2 profiles", "claude-personal", "codex-work", "5H", "7D", "56%", "73%", "Launch", "codex --search", "work subscription", "run", "login", "quit"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("view is missing %q:\n%s", want, view)
 		}
@@ -67,22 +79,19 @@ func TestViewShowsSelectedModelWhenKnown(t *testing.T) {
 	}
 }
 
-// The command column is the one that yields room, so a narrow terminal must
-// keep the model visible rather than wrapping the row.
-func TestViewDropsCommandColumnWhenNarrow(t *testing.T) {
+// The selected-profile panel owns launch details, so a narrow table can keep
+// both model and remaining usage visible without wrapping rows.
+func TestViewKeepsModelAndUsageWhenNarrow(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", root)
 	writeProfileFile(t, root, `{"model":"opus"}`, "claude-personal", "claude", "settings.json")
-	wide := tuiModel{profiles: testProfiles(), width: 100}.View()
-	narrow := tuiModel{profiles: testProfiles(), width: 46}.View()
-	if !strings.Contains(wide, "COMMAND") {
-		t.Fatalf("wide view should show the command column:\n%s", wide)
-	}
-	if strings.Contains(narrow, "COMMAND") {
-		t.Fatalf("narrow view should drop the command column:\n%s", narrow)
-	}
-	if !strings.Contains(narrow, "opus") {
-		t.Fatalf("narrow view dropped the model instead:\n%s", narrow)
+	usage := map[string]usageRemaining{"claude-personal": {
+		FiveHour: usageWindow{Percent: 56, Known: true},
+		Weekly:   usageWindow{Percent: 97, Known: true},
+	}}
+	narrow := tuiModel{profiles: testProfiles(), width: 46, usage: usage}.View()
+	if !strings.Contains(narrow, "opus") || !strings.Contains(narrow, "5H") || !strings.Contains(narrow, "7D") || !strings.Contains(narrow, "56%") || !strings.Contains(narrow, "97%") {
+		t.Fatalf("narrow view dropped model or usage:\n%s", narrow)
 	}
 	for _, line := range strings.Split(narrow, "\n") {
 		if lipgloss.Width(line) > 46 {
@@ -126,12 +135,61 @@ func TestViewEmptyStateInvitesFirstProfile(t *testing.T) {
 func TestViewFormShowsFieldsAndError(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	m := tuiModel{profiles: testProfiles(), width: 80, mode: tuiForm}
-	m.form = profileForm{name: "codex-work", provider: "codex", command: "codex", field: 1, original: "codex-work"}
+	m.form = profileForm{name: "codex-work", provider: "codex", command: "codex", defaultArgs: "--search", notes: "work", field: 1, original: "codex-work"}
 	m.setStatus(statusErr, "already exists")
 	view := m.View()
-	for _, want := range []string{"Edit codex-work", "Name", "Provider", "Command", "known providers", "✗ already exists"} {
+	for _, want := range []string{"Edit codex-work", "Name", "Provider", "Command", "Default args", "Notes", "--search", "work", "known providers", "✗ already exists"} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("form view is missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestSaveFormPersistsDefaultArgsAndNotes(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", root)
+	path, err := configPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveConfig(path, Config{}); err != nil {
+		t.Fatal(err)
+	}
+	m := tuiModel{configPath: path}
+	m.form = profileForm{
+		name:        "codex-work",
+		provider:    "codex",
+		command:     "codex",
+		defaultArgs: `--model "gpt 5" --search`,
+		notes:       "  weekly allowance  ",
+		isNew:       true,
+	}
+	if err := m.saveForm(); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := loadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile, err := findProfile(cfg, "codex-work")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(profile.DefaultArgs, "|") != "--model|gpt 5|--search" || profile.Notes != "weekly allowance" {
+		t.Fatalf("saved profile = %+v", profile)
+	}
+}
+
+func TestFormAcceptsSpacesInDefaultArgsAndNotes(t *testing.T) {
+	for _, field := range []int{3, 4} {
+		m := tuiModel{mode: tuiForm, form: profileForm{field: field}}
+		updated, _ := m.updateForm(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("first")})
+		updated, _ = updated.(tuiModel).updateForm(tea.KeyMsg{Type: tea.KeySpace, Runes: []rune(" ")})
+		updated, _ = updated.(tuiModel).updateForm(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("second")})
+		result := updated.(tuiModel)
+		got := result.formValue()
+		if got != "first second" {
+			t.Fatalf("field %d value = %q, want a preserved space", field, got)
 		}
 	}
 }

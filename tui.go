@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -26,17 +27,21 @@ const (
 )
 
 type profileForm struct {
-	name     string
-	provider string
-	command  string
-	field    int
-	original string
-	isNew    bool
+	name        string
+	provider    string
+	command     string
+	defaultArgs string
+	notes       string
+	field       int
+	original    string
+	isNew       bool
 }
 
 type processFinishedMsg struct {
 	err error
 }
+
+type usageLoadedMsg map[string]usageRemaining
 
 type statusKind int
 
@@ -57,6 +62,7 @@ type tuiModel struct {
 	width      int
 	running    bool
 	unlock     func()
+	usage      map[string]usageRemaining
 }
 
 func (m *tuiModel) setStatus(kind statusKind, message string) {
@@ -84,7 +90,14 @@ func runTUI() error {
 }
 
 func (m tuiModel) Init() tea.Cmd {
-	return nil
+	return loadUsageCmd(m.profiles)
+}
+
+func loadUsageCmd(profiles []Profile) tea.Cmd {
+	profiles = append([]Profile(nil), profiles...)
+	return func() tea.Msg {
+		return usageLoadedMsg(loadProfileUsage(profiles, time.Now()))
+	}
 }
 
 func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -117,6 +130,9 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.setStatus(statusOK, "process finished")
 		}
+		return m, loadUsageCmd(m.profiles)
+	case usageLoadedMsg:
+		m.usage = msg
 	}
 	return m, nil
 }
@@ -141,9 +157,19 @@ func (m tuiModel) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if len(m.profiles) > 0 {
 			profile := m.profiles[m.cursor]
 			m.mode = tuiForm
-			m.form = profileForm{name: profile.Name, provider: profile.Provider, command: profile.Command, original: profile.Name}
+			m.form = profileForm{
+				name:        profile.Name,
+				provider:    profile.Provider,
+				command:     profile.Command,
+				defaultArgs: formatArguments(profile.DefaultArgs),
+				notes:       profile.Notes,
+				original:    profile.Name,
+			}
 			m.clearStatus()
 		}
+	case "r":
+		m.usage = nil
+		return m, loadUsageCmd(m.profiles)
 	case "x":
 		if len(m.profiles) > 0 {
 			m.mode = tuiConfirmDelete
@@ -164,7 +190,8 @@ func (m tuiModel) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "enter":
 		if len(m.profiles) > 0 {
-			return m, m.execProfile(m.profiles[m.cursor], nil)
+			profile := m.profiles[m.cursor]
+			return m, m.execProfile(profile, profileRunArgs(profile, nil))
 		}
 	}
 	return m, nil
@@ -245,7 +272,7 @@ func (m tuiModel) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.clearStatus()
 		return m, nil
 	case "tab", "down", "enter":
-		if m.form.field < 2 {
+		if m.form.field < 4 {
 			m.form.field++
 			return m, nil
 		}
@@ -254,7 +281,7 @@ func (m tuiModel) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.mode = tuiList
-		return m, nil
+		return m, loadUsageCmd(m.profiles)
 	case "shift+tab", "up":
 		if m.form.field > 0 {
 			m.form.field--
@@ -262,16 +289,15 @@ func (m tuiModel) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "backspace", "ctrl+h":
 		value := m.formValue()
-		if len(value) > 0 {
-			value = value[:len(value)-1]
-			m.setFormValue(value)
+		if runes := []rune(value); len(runes) > 0 {
+			m.setFormValue(string(runes[:len(runes)-1]))
 		}
 		return m, nil
 	case "ctrl+u":
 		m.setFormValue("")
 		return m, nil
 	}
-	if msg.Type == tea.KeyRunes {
+	if msg.Type == tea.KeyRunes || msg.Type == tea.KeySpace {
 		m.setFormValue(m.formValue() + string(msg.Runes))
 	}
 	return m, nil
@@ -283,8 +309,12 @@ func (m *tuiModel) formValue() string {
 		return m.form.name
 	case 1:
 		return m.form.provider
-	default:
+	case 2:
 		return m.form.command
+	case 3:
+		return m.form.defaultArgs
+	default:
+		return m.form.notes
 	}
 }
 
@@ -294,8 +324,12 @@ func (m *tuiModel) setFormValue(value string) {
 		m.form.name = value
 	case 1:
 		m.form.provider = value
-	default:
+	case 2:
 		m.form.command = value
+	case 3:
+		m.form.defaultArgs = value
+	default:
+		m.form.notes = value
 	}
 }
 
@@ -305,6 +339,10 @@ func (m *tuiModel) saveForm() error {
 	}
 	if m.form.provider == "" || m.form.command == "" {
 		return errors.New("provider and command are required")
+	}
+	defaultArgs, err := parseArguments(m.form.defaultArgs)
+	if err != nil {
+		return err
 	}
 	cfg, err := loadConfig(m.configPath)
 	if err != nil {
@@ -321,7 +359,13 @@ func (m *tuiModel) saveForm() error {
 		if err := os.MkdirAll(filepath.Join(root, m.form.name), 0700); err != nil {
 			return err
 		}
-		cfg.Profiles = append(cfg.Profiles, Profile{Name: m.form.name, Provider: m.form.provider, Command: m.form.command})
+		cfg.Profiles = append(cfg.Profiles, Profile{
+			Name:        m.form.name,
+			Provider:    m.form.provider,
+			Command:     m.form.command,
+			DefaultArgs: defaultArgs,
+			Notes:       strings.TrimSpace(m.form.notes),
+		})
 	} else {
 		if m.form.name != m.form.original {
 			if _, err := findProfile(cfg, m.form.name); err == nil {
@@ -337,7 +381,13 @@ func (m *tuiModel) saveForm() error {
 		}
 		for index := range cfg.Profiles {
 			if cfg.Profiles[index].Name == m.form.original {
-				cfg.Profiles[index] = Profile{Name: m.form.name, Provider: m.form.provider, Command: m.form.command}
+				cfg.Profiles[index] = Profile{
+					Name:        m.form.name,
+					Provider:    m.form.provider,
+					Command:     m.form.command,
+					DefaultArgs: defaultArgs,
+					Notes:       strings.TrimSpace(m.form.notes),
+				}
 				break
 			}
 		}
@@ -403,10 +453,10 @@ func (m tuiModel) View() string {
 	switch m.mode {
 	case tuiForm:
 		sections = append(sections, m.formView(width))
-	case tuiConfirmDelete:
-		sections = append(sections, m.listView(width), m.confirmView(width))
+	case tuiConfirmDelete, tuiConfirmKill:
+		sections = append(sections, m.listView(width), m.selectedProfileView(width), m.confirmView(width))
 	default:
-		sections = append(sections, m.listView(width))
+		sections = append(sections, m.listView(width), m.selectedProfileView(width))
 	}
 	sections = append(sections, rule(width), m.helpView(width))
 	if status := m.statusView(width); status != "" {
@@ -453,17 +503,46 @@ func (m tuiModel) listView(width int) string {
 	}
 	nameWidth, providerWidth, modelWidth = min(nameWidth, 26), min(providerWidth, 12), min(modelWidth, 22)
 
-	// The command is the least useful column — it usually repeats the provider —
-	// so it is the one that gives up room, and disappears entirely when a narrow
-	// terminal leaves nothing worth showing.
-	fixed := 2 + nameWidth + 2 + providerWidth + 2 + authWidth + 2 + modelWidth + 2
-	commandWidth := min(width-fixed-runningBadgeWidth, 24)
-	showCommand := commandWidth >= 6
-
-	header := pad("NAME", nameWidth) + "  " + pad("PROVIDER", providerWidth) + "  " + pad("AUTH", authWidth) + "  " + pad("MODEL", modelWidth)
-	if showCommand {
-		header += "  COMMAND"
+	// Notes and the full launch command live in the selected-profile panel. The
+	// table keeps the scan-friendly fields, shrinking columns in usefulness order
+	// when the terminal is narrow.
+	total := 2 + nameWidth + 2 + providerWidth + 2 + authWidth + 2 + modelWidth + 2 + usageWidth + 2 + usageWidth
+	showProvider := total <= width
+	if !showProvider {
+		total -= providerWidth + 2
 	}
+	showAuth := true
+	if total > width {
+		showAuth = false
+		total -= authWidth + 2
+	}
+	for total > width && nameWidth > 8 {
+		nameWidth--
+		total--
+	}
+	for total > width && modelWidth > len("MODEL") {
+		modelWidth--
+		total--
+	}
+	for showProvider && total > width && providerWidth > 4 {
+		providerWidth--
+		total--
+	}
+	for total > width && nameWidth > 1 {
+		nameWidth--
+		total--
+	}
+
+	header := pad(truncate("NAME", nameWidth), nameWidth)
+	if showProvider {
+		header += "  " + pad(truncate("PROVIDER", providerWidth), providerWidth)
+	}
+	if showAuth {
+		header += "  " + pad("AUTH", authWidth)
+	}
+	header += "  " + pad(truncate("MODEL", modelWidth), modelWidth) +
+		"  " + pad("5H", usageWidth) +
+		"  " + pad("7D", usageWidth)
 	rows := []string{"  " + columnHeaderStyle.Render(header)}
 	for index, profile := range m.profiles {
 		bar, name := "  ", nameStyle.Render(pad(truncate(profile.Name, nameWidth), nameWidth))
@@ -471,22 +550,84 @@ func (m tuiModel) listView(width int) string {
 			bar = cursorBarStyle.Render("▌ ")
 			name = nameActiveStyle.Render(pad(truncate(profile.Name, nameWidth), nameWidth))
 		}
-		provider := providerStyle(profile.Provider).Render(pad(truncate(profile.Provider, providerWidth), providerWidth))
-		left := bar + name + "  " + provider + "  " + authCell(profile) + "  " + modelCell(models[index], modelWidth)
-		if showCommand {
-			left += "  " + commandStyle.Render(truncate(profile.Command, commandWidth))
+		left := bar + name
+		if showProvider {
+			provider := providerStyle(profile.Provider).Render(pad(truncate(profile.Provider, providerWidth), providerWidth))
+			left += "  " + provider
 		}
+		if showAuth {
+			left += "  " + authCell(profile)
+		}
+		left += "  " + modelCell(models[index], modelWidth) + "  " + m.usageCell(profile, fiveHourWindow) + "  " + m.usageCell(profile, weeklyWindow)
 		badge := ""
 		if profileIsRunning(profile) {
 			badge = liveStyle.Render("▶ running")
+			if lipgloss.Width(left)+1+lipgloss.Width(badge) > width {
+				badge = liveStyle.Render("▶")
+			}
 		}
 		rows = append(rows, spread(left, badge, width))
 	}
 	return strings.Join(rows, "\n") + "\n"
 }
 
-// runningBadgeWidth reserves room for "▶ running" plus a separating space.
-const runningBadgeWidth = 10
+const usageWidth = 4
+
+type usageWindowKind int
+
+const (
+	fiveHourWindow usageWindowKind = iota
+	weeklyWindow
+)
+
+func (m tuiModel) usageCell(profile Profile, kind usageWindowKind) string {
+	if m.usage == nil {
+		return unknownStyle.Render(pad("…", usageWidth))
+	}
+	usage, exists := m.usage[profile.Name]
+	if !exists {
+		return unknownStyle.Render(pad("—", usageWidth))
+	}
+	window := usage.FiveHour
+	if kind == weeklyWindow {
+		window = usage.Weekly
+	}
+	if !window.Known {
+		return unknownStyle.Render(pad("—", usageWidth))
+	}
+	value := pad(fmt.Sprintf("%d%%", window.Percent), usageWidth)
+	switch {
+	case window.Percent <= 10:
+		return usageCriticalStyle.Render(value)
+	case window.Percent <= 25:
+		return usageWarningStyle.Render(value)
+	default:
+		return usageGoodStyle.Render(value)
+	}
+}
+
+func (m tuiModel) selectedProfileView(width int) string {
+	if len(m.profiles) == 0 || m.cursor >= len(m.profiles) {
+		return ""
+	}
+	profile := m.profiles[m.cursor]
+	launch := formatArguments(append([]string{profile.Command}, profile.DefaultArgs...))
+	defaultArgs := formatArguments(profile.DefaultArgs)
+	if defaultArgs == "" {
+		defaultArgs = "—"
+	}
+	notes := profile.Notes
+	if notes == "" {
+		notes = "—"
+	}
+	valueWidth := max(width-18, 1)
+	lines := []string{
+		fieldLabelStyle.Render(pad("Launch", 12)) + " " + fieldValueStyle.Render(truncate(launch, valueWidth)),
+		fieldLabelStyle.Render(pad("Default args", 12)) + " " + fieldValueStyle.Render(truncate(defaultArgs, valueWidth)),
+		fieldLabelStyle.Render(pad("Notes", 12)) + " " + fieldValueStyle.Render(truncate(notes, valueWidth)),
+	}
+	return "\n" + sectionTitle.Render("Selected") + "\n" + panelStyle.Width(width-2).Render(strings.Join(lines, "\n")) + "\n"
+}
 
 func modelCell(model string, width int) string {
 	if model == "" {
@@ -520,18 +661,22 @@ func (m tuiModel) formView(width int) string {
 		{"Name", m.form.name},
 		{"Provider", m.form.provider},
 		{"Command", m.form.command},
+		{"Default args", m.form.defaultArgs},
+		{"Notes", m.form.notes},
 	}
 	lines := make([]string, 0, len(fields)+1)
 	for index, field := range fields {
-		label, value := fieldLabelStyle.Render(pad(field.label, 9)), fieldValueStyle.Render(field.value)
+		label, value := fieldLabelStyle.Render(pad(field.label, 12)), fieldValueStyle.Render(field.value)
 		if index == m.form.field {
-			label = fieldLabelActive.Render(pad(field.label, 9))
+			label = fieldLabelActive.Render(pad(field.label, 12))
 			value += cursorStyle.Render(" ")
 		}
 		lines = append(lines, label+" "+value)
 	}
 	if m.form.field == 1 {
 		lines = append(lines, "", hintStyle.Render("known providers: codex · claude · opencode · deepseek"))
+	} else if m.form.field == 3 {
+		lines = append(lines, "", hintStyle.Render("shell-style quotes are supported; arguments apply only when running"))
 	}
 	body := panelStyle.Width(width - 2).Render(strings.Join(lines, "\n"))
 	return sectionTitle.Render(heading) + "\n" + body + "\n"
@@ -585,6 +730,7 @@ func (m tuiModel) helpEntries() string {
 		return renderHelp([]helpEntry{
 			{"↵", "run"},
 			{"l", "login"},
+			{"r", "refresh usage"},
 			{"a", "add"},
 			{"e", "edit"},
 			{"x", "delete"},

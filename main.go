@@ -9,7 +9,10 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
+	"syscall"
+	"unicode"
 )
 
 const (
@@ -19,9 +22,11 @@ const (
 )
 
 type Profile struct {
-	Name     string `json:"name"`
-	Provider string `json:"provider"`
-	Command  string `json:"command"`
+	Name        string   `json:"name"`
+	Provider    string   `json:"provider"`
+	Command     string   `json:"command"`
+	DefaultArgs []string `json:"default_args,omitempty"`
+	Notes       string   `json:"notes,omitempty"`
 }
 
 type Config struct {
@@ -175,7 +180,84 @@ func profileCommand(args []string, cfg *Config, path string, stdout io.Writer) e
 }
 
 func launch(profile Profile, args []string, stdout, stderr io.Writer) error {
-	return launchExternal(profile.Command, args, profile, stdout, stderr)
+	return launchExternal(profile.Command, profileRunArgs(profile, args), profile, stdout, stderr)
+}
+
+func profileRunArgs(profile Profile, args []string) []string {
+	result := make([]string, 0, len(profile.DefaultArgs)+len(args))
+	result = append(result, profile.DefaultArgs...)
+	return append(result, args...)
+}
+
+// parseArguments accepts shell-style quoting for convenience in the TUI, but
+// deliberately performs no expansion or command evaluation. The parsed values
+// are passed straight to exec.Command as individual arguments.
+func parseArguments(value string) ([]string, error) {
+	var args []string
+	var current strings.Builder
+	var quote rune
+	escaped, started := false, false
+	for _, char := range value {
+		if escaped {
+			current.WriteRune(char)
+			escaped = false
+			started = true
+			continue
+		}
+		if char == '\\' && quote != '\'' {
+			escaped = true
+			started = true
+			continue
+		}
+		if quote != 0 {
+			if char == quote {
+				quote = 0
+				started = true
+			} else {
+				current.WriteRune(char)
+				started = true
+			}
+			continue
+		}
+		switch {
+		case char == '\'' || char == '"':
+			quote = char
+			started = true
+		case unicode.IsSpace(char):
+			if started {
+				args = append(args, current.String())
+				current.Reset()
+				started = false
+			}
+		default:
+			current.WriteRune(char)
+			started = true
+		}
+	}
+	if escaped {
+		return nil, errors.New("default arguments end with an incomplete escape")
+	}
+	if quote != 0 {
+		return nil, errors.New("default arguments contain an unclosed quote")
+	}
+	if started {
+		args = append(args, current.String())
+	}
+	return args, nil
+}
+
+func formatArguments(args []string) string {
+	formatted := make([]string, len(args))
+	for index, arg := range args {
+		if arg != "" && strings.IndexFunc(arg, func(char rune) bool {
+			return unicode.IsSpace(char) || strings.ContainsRune(`'"\\`, char)
+		}) == -1 {
+			formatted[index] = arg
+			continue
+		}
+		formatted[index] = "'" + strings.ReplaceAll(arg, "'", `'\''`) + "'"
+	}
+	return strings.Join(formatted, " ")
 }
 
 func launchExternal(command string, args []string, profile Profile, stdout, stderr io.Writer) error {
@@ -193,23 +275,60 @@ func launchExternal(command string, args []string, profile Profile, stdout, stde
 
 func acquireProfileLock(workdir string) (func(), error) {
 	lockPath := filepath.Join(workdir, ".active.lock")
-	file, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
-		if errors.Is(err, os.ErrExist) {
+	for attempt := 0; attempt < 3; attempt++ {
+		file, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if err == nil {
+			if _, err := fmt.Fprintf(file, "%d\n", os.Getpid()); err != nil {
+				file.Close()
+				os.Remove(lockPath)
+				return nil, err
+			}
+			if err := file.Close(); err != nil {
+				os.Remove(lockPath)
+				return nil, err
+			}
+			return func() { _ = os.Remove(lockPath) }, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+
+		active, inspectErr := profileLockIsActive(lockPath)
+		if errors.Is(inspectErr, os.ErrNotExist) {
+			continue
+		}
+		if inspectErr != nil || active {
 			return nil, fmt.Errorf("profile is already running (%s); refusing concurrent token refresh", workdir)
 		}
-		return nil, err
+		if err := os.Remove(lockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
 	}
-	if _, err := fmt.Fprintf(file, "%d\n", os.Getpid()); err != nil {
-		file.Close()
-		os.Remove(lockPath)
-		return nil, err
+	return nil, fmt.Errorf("profile is already running (%s); refusing concurrent token refresh", workdir)
+}
+
+// profileLockIsActive reports whether any process recorded in a profile lock
+// still exists. Invalid locks are returned as errors so callers fail closed
+// instead of risking concurrent access to refresh-token state.
+func profileLockIsActive(lockPath string) (bool, error) {
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		return false, err
 	}
-	if err := file.Close(); err != nil {
-		os.Remove(lockPath)
-		return nil, err
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return false, errors.New("profile lock is empty")
 	}
-	return func() { _ = os.Remove(lockPath) }, nil
+	for _, field := range fields {
+		pid, err := strconv.Atoi(field)
+		if err != nil || pid <= 0 {
+			return false, errors.New("profile lock has an invalid process PID")
+		}
+		if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // setProfileChildPID records the process that owns the profile's CLI state.

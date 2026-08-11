@@ -66,6 +66,12 @@ ai codex-work exec -- "review this repository"
 If the bare argument is not an existing profile, `ai` returns an error instead
 of guessing a provider or creating a profile.
 
+Each profile can also store default arguments. They are prepended to arguments
+provided at launch, but are not used for login or integration commands. Set
+them in the interactive profile editor; shell-style quotes group values with
+spaces without invoking a shell. The same editor accepts a short note for each
+profile.
+
 ## Move a profile to another computer
 
 Install [`age`](https://age-encryption.org/) on both computers, then export the
@@ -81,7 +87,11 @@ prompts for the encryption passphrase; the launcher never prints or stores it.
 Imports refuse to replace an existing profile. Treat the bundle like a password
 backup and delete it after transferring it if it is no longer needed. API keys
 provided through environment variables, such as `DEEPSEEK_API_KEY`, are not
-included and must be transferred separately through a secret manager.
+included and must be transferred separately through a secret manager. Codex's
+runtime-only `codex/tmp` tree is omitted; Codex recreates its helper symlinks
+there on the destination machine. OpenCode plugin `node_modules` directories
+are also omitted because they are host-specific and reproducible; reinstall
+them from each plugin's `package.json` and lockfile after importing.
 
 Do not actively use the same imported profile on multiple computers: provider
 refresh tokens may rotate when used.
@@ -113,6 +123,14 @@ OpenCode's state file is preferred because it holds the model last chosen in the
 TUI, which is what OpenCode restores on the next start; the config default only
 applies before anything has been picked.
 
+The `5H` and `7D` columns show the remaining five-hour and weekly quotas
+reported by the selected account's own local CLI cache. Codex is read from the
+newest rate-limit events in that profile's session logs; Claude Code is read
+from its cached usage utilization. Expired or unavailable windows show `—`.
+OpenCode and DeepSeek do not currently expose comparable local quotas. This is
+intentionally profile-local and does not use OpenUsage, so multiple accounts
+for the same provider stay separate. Credential files are never opened.
+
 The check only tests whether the file exists, and reads the API key variable
 only to see whether it is empty; `ai-session` still never opens or prints
 credentials. A profile whose token has expired therefore keeps showing `● yes`
@@ -123,12 +141,14 @@ Use the arrow keys or `j`/`k` to select a profile:
 - Enter runs the selected profile.
 - `l` logs in to the selected profile.
 - `a` adds a profile.
-- `e` edits its name, provider, or command.
+- `e` edits its name, provider, command, default arguments, or note.
+- `r` refreshes locally cached usage percentages.
 - `x` deletes it and its isolated state after confirmation.
 - `q` or Escape quits.
 
-In the profile editor, Enter or Tab advances through the fields; on the final
-field it saves. Escape cancels and Ctrl-U clears the current field.
+The selected-profile panel shows its default arguments and note. In the profile
+editor, Enter or Tab advances through all fields; on the final field it saves.
+Escape cancels and Ctrl-U clears the current field.
 
 DeepSeek should be configured in the OpenCode profile using OpenCode's normal
 provider setup or an environment variable. The launcher preserves ordinary
@@ -153,7 +173,9 @@ The launcher deliberately does not modify OpenUsage's database or copy tokens.
 It runs OpenUsage's supported installer with the selected profile environment,
 so Codex and Claude hooks are installed beside that profile's own state. The
 profile lock also refuses a second process for the same account, preventing
-concurrent refresh-token rotation. Different profiles can still run at once.
+concurrent refresh-token rotation. If a launcher is interrupted, its lock is
+reclaimed automatically after all PIDs recorded in it have exited. Different
+profiles can still run at once.
 In the TUI, select a running profile and press `K` to confirm termination of
 its CLI process. The lock records the launcher PID on its first line and the
 child CLI PID on its second line; an orphaned lock can therefore be cleared

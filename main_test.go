@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -31,7 +32,12 @@ func TestBareProfileInvocationUsesProfileAndArguments(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := saveConfig(path, Config{Profiles: []Profile{{Name: "ka", Provider: "codex", Command: "/bin/echo"}}}); err != nil {
+	if err := saveConfig(path, Config{Profiles: []Profile{{
+		Name:        "ka",
+		Provider:    "codex",
+		Command:     "/bin/echo",
+		DefaultArgs: []string{"from-default"},
+	}}}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -39,8 +45,43 @@ func TestBareProfileInvocationUsesProfileAndArguments(t *testing.T) {
 	if err := run([]string{"ka", "from-profile"}, &stdout, &stderr); err != nil {
 		t.Fatal(err)
 	}
-	if stdout.String() != "from-profile\n" {
-		t.Fatalf("bare profile output = %q, want forwarded argument", stdout.String())
+	if stdout.String() != "from-default from-profile\n" {
+		t.Fatalf("bare profile output = %q, want defaults followed by forwarded argument", stdout.String())
+	}
+}
+
+func TestProfileRunArgsPrependsDefaultsWithoutMutatingInputs(t *testing.T) {
+	profile := Profile{DefaultArgs: []string{"--model", "opus"}}
+	provided := []string{"--print", "hello"}
+	got := profileRunArgs(profile, provided)
+	if strings.Join(got, "|") != "--model|opus|--print|hello" {
+		t.Fatalf("profileRunArgs = %v", got)
+	}
+	got[0] = "changed"
+	if profile.DefaultArgs[0] != "--model" || provided[0] != "--print" {
+		t.Fatalf("profileRunArgs aliased an input slice: profile=%v provided=%v", profile.DefaultArgs, provided)
+	}
+}
+
+func TestParseAndFormatArguments(t *testing.T) {
+	input := `--model opus --append-system-prompt "review carefully" 'empty is next' '' path\ with\ spaces`
+	want := []string{"--model", "opus", "--append-system-prompt", "review carefully", "empty is next", "", "path with spaces", "it's-safe"}
+	input += ` "it's-safe"`
+	got, err := parseArguments(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("parseArguments = %#v, want %#v", got, want)
+	}
+	roundTrip, err := parseArguments(formatArguments(got))
+	if err != nil || fmt.Sprint(roundTrip) != fmt.Sprint(want) {
+		t.Fatalf("format round trip = %#v, err=%v, formatted=%q", roundTrip, err, formatArguments(got))
+	}
+	for _, invalid := range []string{`"unfinished`, `trailing\`} {
+		if _, err := parseArguments(invalid); err == nil {
+			t.Fatalf("parseArguments(%q) unexpectedly succeeded", invalid)
+		}
 	}
 }
 
@@ -260,4 +301,42 @@ func TestProfileLockPreventsConcurrentLaunches(t *testing.T) {
 	if _, err := acquireProfileLock(dir); err == nil {
 		t.Fatal("second lock unexpectedly succeeded")
 	}
+}
+
+func TestProfileLockReclaimsStaleLock(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, ".active.lock")
+	const stalePID = 1 << 30
+	if active, err := profileLockIsActiveForTestPID(stalePID); err != nil || active {
+		t.Skipf("cannot find a demonstrably unused PID: active=%v err=%v", active, err)
+	}
+	if err := os.WriteFile(lockPath, []byte("1073741824\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	unlock, err := acquireProfileLock(dir)
+	if err != nil {
+		t.Fatalf("acquireProfileLock did not reclaim stale lock: %v", err)
+	}
+	defer unlock()
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(data)) != fmt.Sprint(os.Getpid()) {
+		t.Fatalf("replacement lock = %q, want current PID %d", data, os.Getpid())
+	}
+}
+
+func profileLockIsActiveForTestPID(pid int) (bool, error) {
+	dir, err := os.MkdirTemp("", "ai-session-lock-test-")
+	if err != nil {
+		return false, err
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, ".active.lock")
+	if err := os.WriteFile(path, []byte(fmt.Sprintf("%d\n", pid)), 0600); err != nil {
+		return false, err
+	}
+	return profileLockIsActive(path)
 }

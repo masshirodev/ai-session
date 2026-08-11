@@ -178,6 +178,19 @@ func writeProfileBundle(dst io.Writer, profile Profile, workdir string) error {
 		if relative == "." || relative == ".active.lock" {
 			return nil
 		}
+		// Codex creates executable helper symlinks beneath this directory for
+		// each running invocation. They are host-specific, short-lived runtime
+		// state and are recreated automatically on the destination machine.
+		if profile.Provider == "codex" && relative == filepath.Join("codex", "tmp") && info.IsDir() {
+			return filepath.SkipDir
+		}
+		// OpenCode plugins can install npm dependencies under its config tree.
+		// node_modules is generated from the package manifest and lockfile, is
+		// host-specific, and includes executable symlinks in .bin. Keep the
+		// source configuration but omit those reinstallable dependencies.
+		if profile.Provider == "opencode" && info.IsDir() && filepath.Base(relative) == "node_modules" {
+			return filepath.SkipDir
+		}
 		if info.Mode()&os.ModeSymlink != 0 {
 			return fmt.Errorf("refusing to export symlink %q", relative)
 		}
