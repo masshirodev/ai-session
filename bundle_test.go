@@ -156,6 +156,44 @@ func TestWriteProfileBundleSkipsOpenCodeNodeModules(t *testing.T) {
 	}
 }
 
+func TestWriteProfileBundleSkipsRuntimeInstances(t *testing.T) {
+	workdir := t.TempDir()
+	authPath := filepath.Join(workdir, "claude", ".credentials.json")
+	if err := os.MkdirAll(filepath.Dir(authPath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(authPath, []byte(`{"oauth":"opaque"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	instancePath := filepath.Join(workdir, instancesDirectory, "run-test", ".active.lock")
+	if err := os.MkdirAll(filepath.Dir(instancePath), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instancePath, []byte("1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	var archive bytes.Buffer
+	profile := Profile{Name: "cl", Provider: "claude", Command: "claude"}
+	if err := writeProfileBundle(&archive, profile, workdir); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := tar.NewReader(&archive)
+	for {
+		header, err := reader.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(header.Name, "/"+instancesDirectory) {
+			t.Fatalf("archive included runtime instance entry %q", header.Name)
+		}
+	}
+}
+
 func writeTestTarFile(t *testing.T, writer *tar.Writer, name string, data []byte) {
 	t.Helper()
 	if err := writer.WriteHeader(&tar.Header{Name: name, Mode: 0600, Size: int64(len(data))}); err != nil {

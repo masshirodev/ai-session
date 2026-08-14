@@ -9,8 +9,8 @@ tokens. Each launched process receives only its profile-specific state directory
 - Claude Code: `CLAUDE_CONFIG_DIR`
 - OpenCode: `XDG_CONFIG_HOME`, `XDG_DATA_HOME`, and `XDG_STATE_HOME`
 
-This prevents two Codex accounts from racing over one `auth.json` and lets each
-official CLI own its own refresh-token lifecycle. `ai-session` never reads,
+This prevents separate accounts from racing over one credential file and lets
+each official CLI own its refresh-token lifecycle. `ai-session` never reads,
 prints, or stores token contents.
 
 ## Install
@@ -52,6 +52,17 @@ ai run codex-work exec -- "review this repository"
 ai run claude-personal
 ai run opencode-go
 ```
+
+Codex and Claude profiles can be launched concurrently from multiple terminals.
+Every launch creates a temporary directory beneath the profile's `instances/`
+directory for its PID lock, while all instances continue to use the profile's
+single `CODEX_HOME` or `CLAUDE_CONFIG_DIR`. This means one login per profile and
+the same settings and session history in every instance. The instance directory
+is removed when the CLI exits and reclaimed automatically after a crash.
+
+OpenCode profiles remain exclusive: a second launch is refused while the first
+is running because OpenCode's OAuth credential store does not coordinate token
+refreshes across processes.
 
 The `run` command is optional when the first argument is a profile name. These
 are equivalent, and any following arguments are passed to the profile's
@@ -97,8 +108,8 @@ Do not actively use the same imported profile on multiple computers: provider
 refresh tokens may rotate when used.
 
 Running `ai` without arguments opens an interactive Bubble Tea TUI. Providers
-are colour-coded, a profile that currently holds its lock is marked
-`▶ running`, and the `AUTH` column shows whether the profile has logged in:
+are colour-coded, a profile with active launches is marked `▶ running` or
+`▶ N running`, and the `AUTH` column shows whether the profile has logged in:
 
 - `● yes` — the provider's credential file exists in the isolated state
   directory, so `ai run` can use it.
@@ -171,12 +182,12 @@ ai integrate openusage deepseek
 
 The launcher deliberately does not modify OpenUsage's database or copy tokens.
 It runs OpenUsage's supported installer with the selected profile environment,
-so Codex and Claude hooks are installed beside that profile's own state. The
-profile lock also refuses a second process for the same account, preventing
-concurrent refresh-token rotation. If a launcher is interrupted, its lock is
-reclaimed automatically after all PIDs recorded in it have exited. Different
-profiles can still run at once.
-In the TUI, select a running profile and press `K` to confirm termination of
-its CLI process. The lock records the launcher PID on its first line and the
-child CLI PID on its second line; an orphaned lock can therefore be cleared
-from the same action after an interrupted SSH session.
+so Codex and Claude hooks are installed beside that profile's own state. Login,
+integration, and export remain exclusive operations and are refused while any
+instance is running. OpenCode also retains this exclusive lock for ordinary
+runs. If a launcher is interrupted, its lock is reclaimed automatically after
+all PIDs recorded in it have exited. Different profiles can still run at once.
+In the TUI, select a running profile and press `K` to confirm termination of all
+its CLI processes. Each lock records the launcher PID on its first line and the
+child CLI PID on its second line; orphaned locks can therefore be reclaimed
+after an interrupted SSH session.

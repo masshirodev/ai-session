@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -300,6 +301,82 @@ func TestProfileLockPreventsConcurrentLaunches(t *testing.T) {
 	defer unlock()
 	if _, err := acquireProfileLock(dir); err == nil {
 		t.Fatal("second lock unexpectedly succeeded")
+	}
+}
+
+func TestCodexAndClaudeUseIndependentRunLocks(t *testing.T) {
+	for _, provider := range []string{"codex", "claude"} {
+		t.Run(provider, func(t *testing.T) {
+			workdir := t.TempDir()
+			profile := Profile{Name: "personal", Provider: provider, Command: provider}
+			firstDir, unlockFirst, err := acquireProfileRunLock(profile, workdir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer unlockFirst()
+			secondDir, unlockSecond, err := acquireProfileRunLock(profile, workdir)
+			if err != nil {
+				t.Fatalf("second %s instance was refused: %v", provider, err)
+			}
+			defer unlockSecond()
+			if firstDir == secondDir {
+				t.Fatalf("concurrent runs shared one lock directory: %s", firstDir)
+			}
+			for _, dir := range []string{firstDir, secondDir} {
+				if filepath.Base(filepath.Dir(dir)) != instancesDirectory {
+					t.Fatalf("instance lock %q is not beneath %s", dir, instancesDirectory)
+				}
+			}
+		})
+	}
+}
+
+func TestOpenCodeKeepsExclusiveRunLock(t *testing.T) {
+	workdir := t.TempDir()
+	profile := Profile{Name: "open", Provider: "opencode", Command: "opencode"}
+	_, unlock, err := acquireProfileRunLock(profile, workdir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	if _, _, err := acquireProfileRunLock(profile, workdir); err == nil {
+		t.Fatal("second OpenCode run unexpectedly acquired the profile lock")
+	}
+}
+
+func TestExclusiveProfileOperationAndInstancesExcludeEachOther(t *testing.T) {
+	workdir := t.TempDir()
+	profile := Profile{Name: "personal", Provider: "codex", Command: "codex"}
+	_, unlockInstance, err := acquireProfileRunLock(profile, workdir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquireProfileLock(workdir); err == nil {
+		unlockInstance()
+		t.Fatal("exclusive operation acquired a profile with a running instance")
+	}
+	unlockInstance()
+
+	unlockExclusive, err := acquireProfileLock(workdir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlockExclusive()
+	if _, _, err := acquireProfileRunLock(profile, workdir); err == nil {
+		t.Fatal("instance acquired a profile held by an exclusive operation")
+	}
+}
+
+func TestInstanceDirectoryIsRemovedAfterRun(t *testing.T) {
+	workdir := t.TempDir()
+	profile := Profile{Name: "personal", Provider: "claude", Command: "claude"}
+	instanceDir, unlock, err := acquireProfileRunLock(profile, workdir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+	if _, err := os.Stat(instanceDir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("instance directory survived cleanup: %v", err)
 	}
 }
 

@@ -178,6 +178,11 @@ func writeProfileBundle(dst io.Writer, profile Profile, workdir string) error {
 		if relative == "." || relative == ".active.lock" {
 			return nil
 		}
+		// Concurrent Codex and Claude launches keep only process locks here.
+		// It is runtime bookkeeping, not portable profile state.
+		if relative == instancesDirectory && info.IsDir() {
+			return filepath.SkipDir
+		}
 		// Codex creates executable helper symlinks beneath this directory for
 		// each running invocation. They are host-specific, short-lived runtime
 		// state and are recreated automatically on the destination machine.

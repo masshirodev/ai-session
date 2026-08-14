@@ -156,6 +156,10 @@ func (m tuiModel) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "e":
 		if len(m.profiles) > 0 {
 			profile := m.profiles[m.cursor]
+			if profileIsRunning(profile) {
+				m.setStatus(statusErr, "cannot edit a running profile")
+				return m, nil
+			}
 			m.mode = tuiForm
 			m.form = profileForm{
 				name:        profile.Name,
@@ -186,12 +190,12 @@ func (m tuiModel) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "l":
 		if len(m.profiles) > 0 {
-			return m, m.execProfile(m.profiles[m.cursor], loginArgs(m.profiles[m.cursor].Provider))
+			return m, m.execProfile(m.profiles[m.cursor], loginArgs(m.profiles[m.cursor].Provider), true)
 		}
 	case "enter":
 		if len(m.profiles) > 0 {
 			profile := m.profiles[m.cursor]
-			return m, m.execProfile(profile, profileRunArgs(profile, nil))
+			return m, m.execProfile(profile, profileRunArgs(profile, nil), false)
 		}
 	}
 	return m, nil
@@ -223,14 +227,13 @@ func (m tuiModel) updateDelete(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "y", "Y":
 		profile := m.profiles[m.cursor]
+		if profileIsRunning(profile) {
+			m.setStatus(statusErr, "cannot delete a running profile")
+			m.mode = tuiList
+			return m, nil
+		}
 		root, err := profileRoot()
 		if err == nil {
-			lockPath := filepath.Join(root, profile.Name, ".active.lock")
-			if _, lockErr := os.Stat(lockPath); lockErr == nil {
-				m.setStatus(statusErr, "cannot delete a running profile")
-				m.mode = tuiList
-				return m, nil
-			}
 			err = os.RemoveAll(filepath.Join(root, profile.Name))
 		}
 		if err != nil {
@@ -367,6 +370,13 @@ func (m *tuiModel) saveForm() error {
 			Notes:       strings.TrimSpace(m.form.notes),
 		})
 	} else {
+		original, err := findProfile(cfg, m.form.original)
+		if err != nil {
+			return err
+		}
+		if profileIsRunning(original) {
+			return errors.New("cannot edit a running profile")
+		}
 		if m.form.name != m.form.original {
 			if _, err := findProfile(cfg, m.form.name); err == nil {
 				return fmt.Errorf("profile %q already exists", m.form.name)
@@ -407,13 +417,19 @@ func (m *tuiModel) saveForm() error {
 	return nil
 }
 
-func (m *tuiModel) execProfile(profile Profile, args []string) tea.Cmd {
+func (m *tuiModel) execProfile(profile Profile, args []string, exclusive bool) tea.Cmd {
 	workdir, err := ensureProfileState(profile)
 	if err != nil {
 		m.setStatus(statusErr, err.Error())
 		return nil
 	}
-	unlock, err := acquireProfileLock(workdir)
+	var lockDir string
+	var unlock func()
+	if exclusive {
+		lockDir, unlock, err = acquireExclusiveRunLock(workdir)
+	} else {
+		lockDir, unlock, err = acquireProfileRunLock(profile, workdir)
+	}
 	if err != nil {
 		m.setStatus(statusErr, err.Error())
 		return nil
@@ -422,7 +438,7 @@ func (m *tuiModel) execProfile(profile Profile, args []string) tea.Cmd {
 	cmd.Env = append(cleanEnvironment(os.Environ()), profileEnv(profile)...)
 	m.running = true
 	m.unlock = unlock
-	return tea.Exec(trackedExecCommand{cmd: cmd, workdir: workdir}, func(err error) tea.Msg {
+	return tea.Exec(trackedExecCommand{cmd: cmd, workdir: lockDir}, func(err error) tea.Msg {
 		return processFinishedMsg{err: err}
 	})
 }
@@ -560,8 +576,12 @@ func (m tuiModel) listView(width int) string {
 		}
 		left += "  " + modelCell(models[index], modelWidth) + "  " + m.usageCell(profile, fiveHourWindow) + "  " + m.usageCell(profile, weeklyWindow)
 		badge := ""
-		if profileIsRunning(profile) {
-			badge = liveStyle.Render("▶ running")
+		if running := profileRunningCount(profile); running > 0 {
+			badgeText := "▶ running"
+			if running > 1 {
+				badgeText = fmt.Sprintf("▶ %d running", running)
+			}
+			badge = liveStyle.Render(badgeText)
 			if lipgloss.Width(left)+1+lipgloss.Width(badge) > width {
 				badge = liveStyle.Render("▶")
 			}
@@ -689,9 +709,14 @@ func (m tuiModel) confirmView(width int) string {
 	profile := m.profiles[m.cursor]
 	var body string
 	if m.mode == tuiConfirmKill {
+		count := profileRunningCount(profile)
+		detail := "The running CLI process will be terminated."
+		if count > 1 {
+			detail = fmt.Sprintf("All %d running CLI processes will be terminated.", count)
+		}
 		body = dangerPanelStyle.Width(width - 2).Render(lipgloss.JoinVertical(lipgloss.Left,
 			dangerTextStyle.Render("Stop "+profile.Name+"?"),
-			confirmBodyStyle.Render("The running CLI process will be terminated."),
+			confirmBodyStyle.Render(detail),
 		))
 		return "\n" + body + "\n"
 	}
@@ -754,24 +779,30 @@ func (m tuiModel) statusView(width int) string {
 	return "\n" + style.Width(width).Render(icon+" "+m.status)
 }
 
-// profileIsRunning reports whether another process already holds the profile
-// lock, so the list can show which accounts are busy.
-func profileIsRunning(profile Profile) bool {
-	root, err := profileRoot()
-	if err != nil {
-		return false
-	}
-	_, err = os.Stat(filepath.Join(root, profile.Name, ".active.lock"))
-	return err == nil
-}
-
 func terminateProfile(profile Profile) error {
 	root, err := profileRoot()
 	if err != nil {
 		return err
 	}
 	workdir := filepath.Join(root, profile.Name)
-	lockPath := filepath.Join(workdir, ".active.lock")
+	lockDirs, err := activeProfileLocks(workdir)
+	if err != nil {
+		return err
+	}
+	if len(lockDirs) == 0 {
+		return os.ErrNotExist
+	}
+	var errs []error
+	for _, lockDir := range lockDirs {
+		if err := terminateProfileLock(lockDir); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func terminateProfileLock(lockDir string) error {
+	lockPath := filepath.Join(lockDir, ".active.lock")
 	data, err := os.ReadFile(lockPath)
 	if err != nil {
 		return err
@@ -793,21 +824,24 @@ func terminateProfile(profile Profile) error {
 		return err
 	}
 	if err := process.Signal(syscall.Signal(0)); errors.Is(err, syscall.ESRCH) {
-		if removeErr := os.Remove(lockPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			return removeErr
-		}
+		removeProfileLock(lockDir)
 		return staleProfileLockError{pid: pid}
 	}
 	if err := process.Kill(); err != nil {
 		if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
-			if removeErr := os.Remove(lockPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-				return removeErr
-			}
+			removeProfileLock(lockDir)
 			return nil
 		}
 		return err
 	}
 	return nil
+}
+
+func removeProfileLock(lockDir string) {
+	_ = os.Remove(filepath.Join(lockDir, ".active.lock"))
+	if filepath.Base(filepath.Dir(lockDir)) == instancesDirectory {
+		_ = os.RemoveAll(lockDir)
+	}
 }
 
 type staleProfileLockError struct {

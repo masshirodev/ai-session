@@ -1,0 +1,240 @@
+package main
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"syscall"
+)
+
+const instancesDirectory = "instances"
+
+func supportsConcurrentRuns(profile Profile) bool {
+	return profile.Provider == "codex" || profile.Provider == "claude"
+}
+
+// acquireProfileRunLock gives Codex and Claude each a short-lived instance
+// directory while leaving their provider home shared. Providers whose auth
+// storage is not concurrency-safe keep the original profile-wide lock.
+func acquireProfileRunLock(profile Profile, workdir string) (string, func(), error) {
+	if !supportsConcurrentRuns(profile) {
+		return acquireExclusiveRunLock(workdir)
+	}
+	return acquireProfileInstance(workdir)
+}
+
+func acquireExclusiveRunLock(workdir string) (string, func(), error) {
+	unlock, err := acquireProfileLock(workdir)
+	return workdir, unlock, err
+}
+
+// acquireProfileLock is the exclusive side of the profile lock. Login,
+// integration, export, and providers without concurrent auth support use it.
+func acquireProfileLock(workdir string) (func(), error) {
+	unlock, err := acquireProcessLock(workdir)
+	if err != nil {
+		return nil, err
+	}
+	instances, err := activeProfileInstanceLocks(workdir)
+	if err != nil || len(instances) > 0 {
+		unlock()
+		if err != nil {
+			return nil, err
+		}
+		return nil, profileBusyError(workdir)
+	}
+	return unlock, nil
+}
+
+func acquireProfileInstance(workdir string) (string, func(), error) {
+	root := filepath.Join(workdir, instancesDirectory)
+	if err := os.MkdirAll(root, 0700); err != nil {
+		return "", nil, err
+	}
+	stagingDir, err := os.MkdirTemp(root, ".creating-")
+	if err != nil {
+		return "", nil, err
+	}
+	unlockStaging, err := acquireProcessLock(stagingDir)
+	if err != nil {
+		_ = os.RemoveAll(stagingDir)
+		return "", nil, err
+	}
+	instanceDir := filepath.Join(root, "run-"+strings.TrimPrefix(filepath.Base(stagingDir), ".creating-"))
+	if err := os.Rename(stagingDir, instanceDir); err != nil {
+		unlockStaging()
+		_ = os.RemoveAll(stagingDir)
+		return "", nil, err
+	}
+	cleanup := func() {
+		_ = os.RemoveAll(instanceDir)
+	}
+
+	// Creating the instance before checking the exclusive lock closes both
+	// sides of the race: an exclusive caller will see this instance, while an
+	// already-exclusive caller is visible here.
+	active, err := activeLock(filepath.Join(workdir, ".active.lock"), true)
+	if err != nil || active {
+		cleanup()
+		if err != nil {
+			return "", nil, err
+		}
+		return "", nil, profileBusyError(workdir)
+	}
+	return instanceDir, cleanup, nil
+}
+
+func acquireProcessLock(workdir string) (func(), error) {
+	lockPath := filepath.Join(workdir, ".active.lock")
+	for attempt := 0; attempt < 3; attempt++ {
+		file, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+		if err == nil {
+			if _, err := fmt.Fprintf(file, "%d\n", os.Getpid()); err != nil {
+				_ = file.Close()
+				_ = os.Remove(lockPath)
+				return nil, err
+			}
+			if err := file.Close(); err != nil {
+				_ = os.Remove(lockPath)
+				return nil, err
+			}
+			return func() { _ = os.Remove(lockPath) }, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
+			return nil, err
+		}
+
+		active, inspectErr := profileLockIsActive(lockPath)
+		if errors.Is(inspectErr, os.ErrNotExist) {
+			continue
+		}
+		if inspectErr != nil || active {
+			return nil, profileBusyError(workdir)
+		}
+		if err := os.Remove(lockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+	}
+	return nil, profileBusyError(workdir)
+}
+
+func profileBusyError(workdir string) error {
+	return fmt.Errorf("profile is already running (%s); refusing exclusive access", workdir)
+}
+
+// profileLockIsActive reports whether any process recorded in a profile lock
+// still exists. Invalid locks are returned as errors so callers fail closed.
+func profileLockIsActive(lockPath string) (bool, error) {
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		return false, err
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return false, errors.New("profile lock is empty")
+	}
+	for _, field := range fields {
+		pid, err := strconv.Atoi(field)
+		if err != nil || pid <= 0 {
+			return false, errors.New("profile lock has an invalid process PID")
+		}
+		if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func activeLock(lockPath string, removeStale bool) (bool, error) {
+	active, err := profileLockIsActive(lockPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil || active {
+		return active, err
+	}
+	if removeStale {
+		if err := os.Remove(lockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+func activeProfileInstanceLocks(workdir string) ([]string, error) {
+	root := filepath.Join(workdir, instancesDirectory)
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var locks []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		// A launch writes its PID lock before atomically renaming this staging
+		// directory. Ignoring it avoids treating a half-created instance as
+		// stale; the creator checks the exclusive lock after the rename.
+		if strings.HasPrefix(entry.Name(), ".creating-") {
+			continue
+		}
+		instanceDir := filepath.Join(root, entry.Name())
+		active, err := activeLock(filepath.Join(instanceDir, ".active.lock"), false)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		if active {
+			locks = append(locks, instanceDir)
+			continue
+		}
+		_ = os.RemoveAll(instanceDir)
+	}
+	sort.Strings(locks)
+	return locks, nil
+}
+
+func activeProfileLocks(workdir string) ([]string, error) {
+	var locks []string
+	active, err := activeLock(filepath.Join(workdir, ".active.lock"), true)
+	if err != nil {
+		return nil, err
+	}
+	if active {
+		locks = append(locks, workdir)
+	}
+	instances, err := activeProfileInstanceLocks(workdir)
+	if err != nil {
+		return nil, err
+	}
+	return append(locks, instances...), nil
+}
+
+func profileRunningCount(profile Profile) int {
+	root, err := profileRoot()
+	if err != nil {
+		return 0
+	}
+	locks, err := activeProfileLocks(filepath.Join(root, profile.Name))
+	if err != nil {
+		return 1
+	}
+	return len(locks)
+}
+
+func profileIsRunning(profile Profile) bool {
+	return profileRunningCount(profile) > 0
+}
+
+// setProfileChildPID records the launcher and provider CLI processes. For a
+// concurrent launch, workdir is that launch's instance directory.
+func setProfileChildPID(workdir string, pid int) error {
+	lockPath := filepath.Join(workdir, ".active.lock")
+	return os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n%d\n", os.Getpid(), pid)), 0600)
+}

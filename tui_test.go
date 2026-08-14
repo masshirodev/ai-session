@@ -121,6 +121,45 @@ func TestViewMarksRunningProfiles(t *testing.T) {
 	}
 }
 
+func TestViewCountsConcurrentProfileInstances(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", root)
+	profile := Profile{Name: "codex-work", Provider: "codex", Command: "codex"}
+	workdir := filepath.Join(root, appName, "profiles", profile.Name)
+	for _, name := range []string{"run-one", "run-two"} {
+		dir := filepath.Join(workdir, instancesDirectory, name)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".active.lock"), []byte("1\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	view := tuiModel{profiles: []Profile{profile}, width: 80}.View()
+	if !strings.Contains(view, "2 running") {
+		t.Fatalf("concurrent instance count missing:\n%s", view)
+	}
+}
+
+func TestEditRefusesRunningProfile(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", root)
+	profile := Profile{Name: "claude-personal", Provider: "claude", Command: "claude"}
+	dir := filepath.Join(root, appName, "profiles", profile.Name, instancesDirectory, "run-one")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ".active.lock"), []byte("1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	m := tuiModel{profiles: []Profile{profile}, mode: tuiList}
+	updated, _ := m.updateList(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("e")})
+	got := updated.(tuiModel)
+	if got.mode != tuiList || !strings.Contains(got.status, "cannot edit") {
+		t.Fatalf("running profile entered edit mode: mode=%v status=%q", got.mode, got.status)
+	}
+}
+
 func TestViewEmptyStateInvitesFirstProfile(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	view := tuiModel{width: 80}.View()

@@ -9,9 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
-	"syscall"
 	"unicode"
 )
 
@@ -78,7 +76,7 @@ func run(args []string, stdout, stderr io.Writer) error {
 		if err != nil {
 			return err
 		}
-		return launch(profile, loginArgs(profile.Provider), stdout, stderr)
+		return launchExclusive(profile, loginArgs(profile.Provider), stdout, stderr)
 	case "env":
 		if len(args) != 2 {
 			return errors.New("usage: ai env <profile>")
@@ -180,7 +178,11 @@ func profileCommand(args []string, cfg *Config, path string, stdout io.Writer) e
 }
 
 func launch(profile Profile, args []string, stdout, stderr io.Writer) error {
-	return launchExternal(profile.Command, profileRunArgs(profile, args), profile, stdout, stderr)
+	return launchProfileCommand(profile.Command, profileRunArgs(profile, args), profile, stdout, stderr)
+}
+
+func launchExclusive(profile Profile, args []string, stdout, stderr io.Writer) error {
+	return launchExternal(profile.Command, args, profile, stdout, stderr)
 }
 
 func profileRunArgs(profile Profile, args []string) []string {
@@ -273,82 +275,37 @@ func launchExternal(command string, args []string, profile Profile, stdout, stde
 	return runLockedCommand(cmd, workdir)
 }
 
-func acquireProfileLock(workdir string) (func(), error) {
-	lockPath := filepath.Join(workdir, ".active.lock")
-	for attempt := 0; attempt < 3; attempt++ {
-		file, err := os.OpenFile(lockPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-		if err == nil {
-			if _, err := fmt.Fprintf(file, "%d\n", os.Getpid()); err != nil {
-				file.Close()
-				os.Remove(lockPath)
-				return nil, err
-			}
-			if err := file.Close(); err != nil {
-				os.Remove(lockPath)
-				return nil, err
-			}
-			return func() { _ = os.Remove(lockPath) }, nil
-		}
-		if !errors.Is(err, os.ErrExist) {
-			return nil, err
-		}
-
-		active, inspectErr := profileLockIsActive(lockPath)
-		if errors.Is(inspectErr, os.ErrNotExist) {
-			continue
-		}
-		if inspectErr != nil || active {
-			return nil, fmt.Errorf("profile is already running (%s); refusing concurrent token refresh", workdir)
-		}
-		if err := os.Remove(lockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return nil, err
-		}
-	}
-	return nil, fmt.Errorf("profile is already running (%s); refusing concurrent token refresh", workdir)
-}
-
-// profileLockIsActive reports whether any process recorded in a profile lock
-// still exists. Invalid locks are returned as errors so callers fail closed
-// instead of risking concurrent access to refresh-token state.
-func profileLockIsActive(lockPath string) (bool, error) {
-	data, err := os.ReadFile(lockPath)
-	if err != nil {
-		return false, err
-	}
-	fields := strings.Fields(string(data))
-	if len(fields) == 0 {
-		return false, errors.New("profile lock is empty")
-	}
-	for _, field := range fields {
-		pid, err := strconv.Atoi(field)
-		if err != nil || pid <= 0 {
-			return false, errors.New("profile lock has an invalid process PID")
-		}
-		if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
-			return true, nil
-		}
-	}
-	return false, nil
-}
-
-// setProfileChildPID records the process that owns the profile's CLI state.
-// The first line remains the launcher PID for compatibility with older locks;
-// the second line is the child PID that the TUI may terminate.
-func setProfileChildPID(workdir string, pid int) error {
-	lockPath := filepath.Join(workdir, ".active.lock")
-	return os.WriteFile(lockPath, []byte(fmt.Sprintf("%d\n%d\n", os.Getpid(), pid)), 0600)
-}
-
 func runLockedCommand(cmd *exec.Cmd, workdir string) error {
-	unlock, err := acquireProfileLock(workdir)
+	lockDir, unlock, err := acquireExclusiveRunLock(workdir)
 	if err != nil {
 		return err
 	}
+	return runCommandWithLock(cmd, lockDir, unlock)
+}
+
+func launchProfileCommand(command string, args []string, profile Profile, stdout, stderr io.Writer) error {
+	workdir, err := ensureProfileState(profile)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(command, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	cmd.Env = append(cleanEnvironment(os.Environ()), profileEnv(profile)...)
+	lockDir, unlock, err := acquireProfileRunLock(profile, workdir)
+	if err != nil {
+		return err
+	}
+	return runCommandWithLock(cmd, lockDir, unlock)
+}
+
+func runCommandWithLock(cmd *exec.Cmd, lockDir string, unlock func()) error {
 	defer unlock()
 	if err := cmd.Start(); err != nil {
 		return err
 	}
-	if err := setProfileChildPID(workdir, cmd.Process.Pid); err != nil {
+	if err := setProfileChildPID(lockDir, cmd.Process.Pid); err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		return err
@@ -743,4 +700,5 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "  ai path")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Providers with isolated state: codex, claude, opencode, deepseek")
+	fmt.Fprintln(w, "Concurrent runs: codex and claude (OpenCode remains exclusive)")
 }
