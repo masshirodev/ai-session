@@ -51,6 +51,29 @@ func TestBareProfileInvocationUsesProfileAndArguments(t *testing.T) {
 	}
 }
 
+func TestUpdateCommandRunsProviderUpdater(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	path, err := configPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveConfig(path, Config{Profiles: []Profile{{
+		Name:     "ka",
+		Provider: "codex",
+		Command:  "/bin/echo",
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr strings.Builder
+	if err := run([]string{"update", "ka"}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "update\n" {
+		t.Fatalf("update command output = %q, want updater arguments", stdout.String())
+	}
+}
+
 func TestProfileRunArgsPrependsDefaultsWithoutMutatingInputs(t *testing.T) {
 	profile := Profile{DefaultArgs: []string{"--model", "opus"}}
 	provided := []string{"--print", "hello"}
@@ -61,6 +84,24 @@ func TestProfileRunArgsPrependsDefaultsWithoutMutatingInputs(t *testing.T) {
 	got[0] = "changed"
 	if profile.DefaultArgs[0] != "--model" || provided[0] != "--print" {
 		t.Fatalf("profileRunArgs aliased an input slice: profile=%v provided=%v", profile.DefaultArgs, provided)
+	}
+}
+
+func TestUpdateArgsUsesProviderUpdaters(t *testing.T) {
+	cases := map[string]string{
+		"claude":   "update",
+		"codex":    "update",
+		"opencode": "upgrade",
+		"deepseek": "upgrade",
+	}
+	for provider, want := range cases {
+		args, err := updateArgs(provider)
+		if err != nil || len(args) != 1 || args[0] != want {
+			t.Errorf("updateArgs(%q) = %v, %v; want [%s], nil", provider, args, err, want)
+		}
+	}
+	if _, err := updateArgs("unknown"); err == nil {
+		t.Fatal("unsupported provider unexpectedly has an updater")
 	}
 }
 

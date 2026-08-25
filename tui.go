@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -22,6 +21,7 @@ type tuiMode int
 const (
 	tuiList tuiMode = iota
 	tuiForm
+	tuiFolder
 	tuiConfirmDelete
 	tuiConfirmKill
 )
@@ -63,6 +63,10 @@ type tuiModel struct {
 	running    bool
 	unlock     func()
 	usage      map[string]usageRemaining
+	workingDir string
+	folderPath string
+	instances  []profileInstance
+	instance   int
 }
 
 func (m *tuiModel) setStatus(kind statusKind, message string) {
@@ -84,7 +88,11 @@ func runTUI() error {
 	if err != nil {
 		return err
 	}
-	m := tuiModel{configPath: configPath, profiles: sortedProfiles(cfg.Profiles)}
+	workingDir, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	m := tuiModel{configPath: configPath, profiles: sortedProfiles(cfg.Profiles), workingDir: workingDir}
 	_, err = tea.NewProgram(m, tea.WithAltScreen()).Run()
 	return err
 }
@@ -114,6 +122,8 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateList(msg)
 		case tuiForm:
 			return m.updateForm(msg)
+		case tuiFolder:
+			return m.updateFolder(msg)
 		case tuiConfirmDelete:
 			return m.updateDelete(msg)
 		case tuiConfirmKill:
@@ -153,6 +163,10 @@ func (m tuiModel) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.mode = tuiForm
 		m.form = profileForm{name: "", provider: "codex", command: "codex", isNew: true}
 		m.clearStatus()
+	case "c":
+		m.mode = tuiFolder
+		m.folderPath = m.workingDir
+		m.clearStatus()
 	case "e":
 		if len(m.profiles) > 0 {
 			profile := m.profiles[m.cursor]
@@ -182,9 +196,16 @@ func (m tuiModel) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "K":
 		if len(m.profiles) > 0 {
 			profile := m.profiles[m.cursor]
-			if !profileIsRunning(profile) {
+			instances, err := activeProfileInstances(profile)
+			if err != nil {
+				m.setStatus(statusErr, err.Error())
 				return m, nil
 			}
+			if len(instances) == 0 {
+				return m, nil
+			}
+			m.instances = instances
+			m.instance = 0
 			m.mode = tuiConfirmKill
 			m.clearStatus()
 		}
@@ -197,13 +218,43 @@ func (m tuiModel) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			profile := m.profiles[m.cursor]
 			return m, m.execProfile(profile, profileRunArgs(profile, nil), false)
 		}
+	case "u":
+		if len(m.profiles) > 0 {
+			return m, m.execUpdate(m.profiles[m.cursor])
+		}
 	}
 	return m, nil
 }
 
 func (m tuiModel) updateKill(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
-	case "y", "Y", "enter":
+	case "up", "k":
+		if m.instance > 0 {
+			m.instance--
+		}
+	case "down", "j":
+		if m.instance < len(m.instances)-1 {
+			m.instance++
+		}
+	case "enter":
+		if len(m.instances) == 0 || m.instance >= len(m.instances) {
+			m.mode = tuiList
+			return m, nil
+		}
+		instance := m.instances[m.instance]
+		if err := terminateProfileLock(instance.lockDir); err != nil {
+			var staleErr staleProfileLockError
+			if errors.As(err, &staleErr) {
+				m.setStatus(statusOK, staleErr.Error())
+			} else {
+				m.setStatus(statusErr, "stop failed: "+err.Error())
+			}
+		} else {
+			m.setStatus(statusOK, fmt.Sprintf("stopped %s instance %d (PID %d)", m.profiles[m.cursor].Name, m.instance+1, instance.pid))
+		}
+		m.instances = nil
+		m.mode = tuiList
+	case "a", "y", "Y":
 		profile := m.profiles[m.cursor]
 		if err := terminateProfile(profile); err != nil {
 			var staleErr staleProfileLockError
@@ -215,10 +266,43 @@ func (m tuiModel) updateKill(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.setStatus(statusOK, "stopped "+profile.Name)
 		}
+		m.instances = nil
 		m.mode = tuiList
 	case "n", "N", "esc", "q":
+		m.instances = nil
 		m.mode = tuiList
 		m.clearStatus()
+	}
+	return m, nil
+}
+
+func (m tuiModel) updateFolder(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.mode = tuiList
+		m.clearStatus()
+		return m, nil
+	case "enter":
+		workingDir, err := resolveWorkingDir(m.folderPath, m.workingDir)
+		if err != nil {
+			m.setStatus(statusErr, err.Error())
+			return m, nil
+		}
+		m.workingDir = workingDir
+		m.mode = tuiList
+		m.setStatus(statusOK, "launch folder set to "+workingDir)
+		return m, nil
+	case "backspace", "ctrl+h":
+		if runes := []rune(m.folderPath); len(runes) > 0 {
+			m.folderPath = string(runes[:len(runes)-1])
+		}
+		return m, nil
+	case "ctrl+u":
+		m.folderPath = ""
+		return m, nil
+	}
+	if msg.Type == tea.KeyRunes || msg.Type == tea.KeySpace {
+		m.folderPath += string(msg.Runes)
 	}
 	return m, nil
 }
@@ -417,6 +501,39 @@ func (m *tuiModel) saveForm() error {
 	return nil
 }
 
+func resolveWorkingDir(value, current string) (string, error) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", errors.New("folder is required")
+	}
+	if value == "~" || strings.HasPrefix(value, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		if value == "~" {
+			value = home
+		} else {
+			value = filepath.Join(home, strings.TrimPrefix(value, "~/"))
+		}
+	}
+	if !filepath.IsAbs(value) {
+		value = filepath.Join(current, value)
+	}
+	workingDir, err := filepath.Abs(value)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(workingDir)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", fmt.Errorf("%s is not a directory", workingDir)
+	}
+	return workingDir, nil
+}
+
 func (m *tuiModel) execProfile(profile Profile, args []string, exclusive bool) tea.Cmd {
 	workdir, err := ensureProfileState(profile)
 	if err != nil {
@@ -435,10 +552,25 @@ func (m *tuiModel) execProfile(profile Profile, args []string, exclusive bool) t
 		return nil
 	}
 	cmd := exec.Command(profile.Command, args...)
+	cmd.Dir = m.workingDir
 	cmd.Env = append(cleanEnvironment(os.Environ()), profileEnv(profile)...)
 	m.running = true
 	m.unlock = unlock
 	return tea.Exec(trackedExecCommand{cmd: cmd, workdir: lockDir}, func(err error) tea.Msg {
+		return processFinishedMsg{err: err}
+	})
+}
+
+func (m *tuiModel) execUpdate(profile Profile) tea.Cmd {
+	args, err := updateArgs(profile.Provider)
+	if err != nil {
+		m.setStatus(statusErr, err.Error())
+		return nil
+	}
+	cmd := exec.Command(profile.Command, args...)
+	cmd.Dir = m.workingDir
+	m.running = true
+	return tea.ExecProcess(cmd, func(err error) tea.Msg {
 		return processFinishedMsg{err: err}
 	})
 }
@@ -469,6 +601,8 @@ func (m tuiModel) View() string {
 	switch m.mode {
 	case tuiForm:
 		sections = append(sections, m.formView(width))
+	case tuiFolder:
+		sections = append(sections, m.folderView(width))
 	case tuiConfirmDelete, tuiConfirmKill:
 		sections = append(sections, m.listView(width), m.selectedProfileView(width), m.confirmView(width))
 	default:
@@ -640,9 +774,14 @@ func (m tuiModel) selectedProfileView(width int) string {
 	if notes == "" {
 		notes = "—"
 	}
+	workingDir := m.workingDir
+	if workingDir == "" {
+		workingDir = "—"
+	}
 	valueWidth := max(width-18, 1)
 	lines := []string{
 		fieldLabelStyle.Render(pad("Launch", 12)) + " " + fieldValueStyle.Render(truncate(launch, valueWidth)),
+		fieldLabelStyle.Render(pad("Folder", 12)) + " " + fieldValueStyle.Render(truncate(workingDir, valueWidth)),
 		fieldLabelStyle.Render(pad("Default args", 12)) + " " + fieldValueStyle.Render(truncate(defaultArgs, valueWidth)),
 		fieldLabelStyle.Render(pad("Notes", 12)) + " " + fieldValueStyle.Render(truncate(notes, valueWidth)),
 	}
@@ -702,6 +841,16 @@ func (m tuiModel) formView(width int) string {
 	return sectionTitle.Render(heading) + "\n" + body + "\n"
 }
 
+func (m tuiModel) folderView(width int) string {
+	value := fieldValueStyle.Render(m.folderPath) + cursorStyle.Render(" ")
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		fieldLabelActive.Render(pad("Folder", 12))+" "+value,
+		"",
+		hintStyle.Render("Relative paths use the current launch folder. ~ is supported."),
+	)
+	return sectionTitle.Render("Change launch folder") + "\n" + panelStyle.Width(width-2).Render(content) + "\n"
+}
+
 func (m tuiModel) confirmView(width int) string {
 	if m.cursor >= len(m.profiles) {
 		return ""
@@ -709,15 +858,18 @@ func (m tuiModel) confirmView(width int) string {
 	profile := m.profiles[m.cursor]
 	var body string
 	if m.mode == tuiConfirmKill {
-		count := profileRunningCount(profile)
-		detail := "The running CLI process will be terminated."
-		if count > 1 {
-			detail = fmt.Sprintf("All %d running CLI processes will be terminated.", count)
+		lines := []string{dangerTextStyle.Render("Stop a " + profile.Name + " instance?")}
+		for index, instance := range m.instances {
+			label := fmt.Sprintf("Instance %d (PID %d)", index+1, instance.pid)
+			if index == m.instance {
+				label = cursorBarStyle.Render("▌ ") + dangerTextStyle.Render(label)
+			} else {
+				label = "  " + confirmBodyStyle.Render(label)
+			}
+			lines = append(lines, label)
 		}
-		body = dangerPanelStyle.Width(width - 2).Render(lipgloss.JoinVertical(lipgloss.Left,
-			dangerTextStyle.Render("Stop "+profile.Name+"?"),
-			confirmBodyStyle.Render(detail),
-		))
+		lines = append(lines, "", confirmBodyStyle.Render("Enter stops the selected instance. a or y stops them all."))
+		body = dangerPanelStyle.Width(width - 2).Render(lipgloss.JoinVertical(lipgloss.Left, lines...))
 		return "\n" + body + "\n"
 	}
 	content := lipgloss.JoinVertical(lipgloss.Left,
@@ -744,10 +896,12 @@ func (m tuiModel) helpEntries() string {
 			{"ctrl-u", "clear"},
 			{"esc", "cancel"},
 		})
+	case tuiFolder:
+		return renderHelp([]helpEntry{{"↵", "set folder"}, {"ctrl-u", "clear"}, {"esc", "cancel"}})
 	case tuiConfirmDelete:
 		return renderHelp([]helpEntry{{"y", "delete"}, {"n/esc", "keep"}})
 	case tuiConfirmKill:
-		return renderHelp([]helpEntry{{"y/enter", "stop"}, {"n/esc", "keep running"}})
+		return renderHelp([]helpEntry{{"↑↓/jk", "choose instance"}, {"↵", "stop selected"}, {"a/y", "stop all"}, {"n/esc", "keep running"}})
 	default:
 		if len(m.profiles) == 0 {
 			return renderHelp([]helpEntry{{"a", "add profile"}, {"q", "quit"}})
@@ -755,6 +909,8 @@ func (m tuiModel) helpEntries() string {
 		return renderHelp([]helpEntry{
 			{"↵", "run"},
 			{"l", "login"},
+			{"u", "update CLI"},
+			{"c", "change folder"},
 			{"r", "refresh usage"},
 			{"a", "add"},
 			{"e", "edit"},
@@ -802,22 +958,9 @@ func terminateProfile(profile Profile) error {
 }
 
 func terminateProfileLock(lockDir string) error {
-	lockPath := filepath.Join(lockDir, ".active.lock")
-	data, err := os.ReadFile(lockPath)
+	pid, err := profileLockPID(lockDir)
 	if err != nil {
 		return err
-	}
-	lines := strings.Fields(string(data))
-	if len(lines) == 0 {
-		return errors.New("profile lock is empty")
-	}
-	pidText := lines[0]
-	if len(lines) >= 2 {
-		pidText = lines[1]
-	}
-	pid, err := strconv.Atoi(pidText)
-	if err != nil || pid <= 0 {
-		return errors.New("profile lock has an invalid process PID")
 	}
 	process, err := os.FindProcess(pid)
 	if err != nil {

@@ -77,6 +77,15 @@ func run(args []string, stdout, stderr io.Writer) error {
 			return err
 		}
 		return launchExclusive(profile, loginArgs(profile.Provider), stdout, stderr)
+	case "update":
+		if len(args) != 2 {
+			return errors.New("usage: ai update <profile>")
+		}
+		profile, err := findProfile(cfg, args[1])
+		if err != nil {
+			return err
+		}
+		return launchUpdate(profile, stdout, stderr)
 	case "env":
 		if len(args) != 2 {
 			return errors.New("usage: ai env <profile>")
@@ -183,6 +192,18 @@ func launch(profile Profile, args []string, stdout, stderr io.Writer) error {
 
 func launchExclusive(profile Profile, args []string, stdout, stderr io.Writer) error {
 	return launchExternal(profile.Command, args, profile, stdout, stderr)
+}
+
+func launchUpdate(profile Profile, stdout, stderr io.Writer) error {
+	args, err := updateArgs(profile.Provider)
+	if err != nil {
+		return err
+	}
+	cmd := exec.Command(profile.Command, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	return cmd.Run()
 }
 
 func profileRunArgs(profile Profile, args []string) []string {
@@ -334,6 +355,17 @@ func loginArgs(provider string) []string {
 		return []string{"auth", "login"}
 	default:
 		return nil
+	}
+}
+
+func updateArgs(provider string) ([]string, error) {
+	switch provider {
+	case "claude", "codex":
+		return []string{"update"}, nil
+	case "opencode", "deepseek":
+		return []string{"upgrade"}, nil
+	default:
+		return nil, fmt.Errorf("provider %q has no supported updater", provider)
 	}
 }
 
@@ -693,6 +725,7 @@ func usage(w io.Writer) {
 	fmt.Fprintln(w, "  ai profile export <profile> <bundle.age>")
 	fmt.Fprintln(w, "  ai profile import <bundle.age>")
 	fmt.Fprintln(w, "  ai login <profile>")
+	fmt.Fprintln(w, "  ai update <profile>")
 	fmt.Fprintln(w, "  ai run <profile> [arguments...]")
 	fmt.Fprintln(w, "  ai <profile> [arguments...]             shorthand for ai run")
 	fmt.Fprintln(w, "  ai env <profile>")

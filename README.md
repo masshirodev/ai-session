@@ -38,6 +38,16 @@ ai login claude-personal
 ai login opencode-go
 ```
 
+Update a profile's CLI with its supported updater:
+
+```sh
+ai update codex-personal
+ai update claude-personal
+ai update opencode-go
+```
+
+This runs `codex update`, `claude update`, or `opencode upgrade` respectively.
+
 `ai run` uses the credentials already stored in that profile. A new profile has
 no credentials until you run `ai login <profile>`; the login flow is performed
 by the official CLI and may open a browser or ask for a device code. The
@@ -147,14 +157,24 @@ only to see whether it is empty; `ai-session` still never opens or prints
 credentials. A profile whose token has expired therefore keeps showing `● yes`
 until the official CLI asks you to log in again.
 
+The TUI starts in the directory where you ran `ai`. Press `c` to set another
+launch folder without leaving the TUI; relative paths resolve from the current
+launch folder and `~` is supported. The chosen folder applies to subsequent
+CLI launches in that TUI session and does not change the parent shell's
+directory.
+
 Use the arrow keys or `j`/`k` to select a profile:
 
 - Enter runs the selected profile.
 - `l` logs in to the selected profile.
+- `u` updates the selected provider CLI.
+- `c` changes the folder used for subsequent CLI launches.
 - `a` adds a profile.
 - `e` edits its name, provider, command, default arguments, or note.
 - `r` refreshes locally cached usage percentages.
 - `x` deletes it and its isolated state after confirmation.
+- `K` selects a running instance to stop; Enter stops that instance, while
+  `a` or `y` stops every instance for the selected profile.
 - `q` or Escape quits.
 
 The selected-profile panel shows its default arguments and note. In the profile
@@ -187,7 +207,7 @@ integration, and export remain exclusive operations and are refused while any
 instance is running. OpenCode also retains this exclusive lock for ordinary
 runs. If a launcher is interrupted, its lock is reclaimed automatically after
 all PIDs recorded in it have exited. Different profiles can still run at once.
-In the TUI, select a running profile and press `K` to confirm termination of all
-its CLI processes. Each lock records the launcher PID on its first line and the
-child CLI PID on its second line; orphaned locks can therefore be reclaimed
-after an interrupted SSH session.
+In the TUI, select a running profile and press `K` to choose an individual CLI
+process by PID, or stop all of that profile's instances. Each lock records the
+launcher PID on its first line and the child CLI PID on its second line;
+orphaned locks can therefore be reclaimed after an interrupted SSH session.

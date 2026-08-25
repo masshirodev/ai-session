@@ -13,6 +13,11 @@ import (
 
 const instancesDirectory = "instances"
 
+type profileInstance struct {
+	lockDir string
+	pid     int
+}
+
 func supportsConcurrentRuns(profile Profile) bool {
 	return profile.Provider == "codex" || profile.Provider == "claude"
 }
@@ -129,24 +134,44 @@ func profileBusyError(workdir string) error {
 // profileLockIsActive reports whether any process recorded in a profile lock
 // still exists. Invalid locks are returned as errors so callers fail closed.
 func profileLockIsActive(lockPath string) (bool, error) {
-	data, err := os.ReadFile(lockPath)
+	pids, err := profileLockPIDs(lockPath)
 	if err != nil {
 		return false, err
 	}
-	fields := strings.Fields(string(data))
-	if len(fields) == 0 {
-		return false, errors.New("profile lock is empty")
-	}
-	for _, field := range fields {
-		pid, err := strconv.Atoi(field)
-		if err != nil || pid <= 0 {
-			return false, errors.New("profile lock has an invalid process PID")
-		}
+	for _, pid := range pids {
 		if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
 			return true, nil
 		}
 	}
 	return false, nil
+}
+
+func profileLockPID(lockDir string) (int, error) {
+	pids, err := profileLockPIDs(filepath.Join(lockDir, ".active.lock"))
+	if err != nil {
+		return 0, err
+	}
+	return pids[len(pids)-1], nil
+}
+
+func profileLockPIDs(lockPath string) ([]int, error) {
+	data, err := os.ReadFile(lockPath)
+	if err != nil {
+		return nil, err
+	}
+	fields := strings.Fields(string(data))
+	if len(fields) == 0 {
+		return nil, errors.New("profile lock is empty")
+	}
+	pids := make([]int, 0, len(fields))
+	for _, field := range fields {
+		pid, err := strconv.Atoi(field)
+		if err != nil || pid <= 0 {
+			return nil, errors.New("profile lock has an invalid process PID")
+		}
+		pids = append(pids, pid)
+	}
+	return pids, nil
 }
 
 func activeLock(lockPath string, removeStale bool) (bool, error) {
@@ -214,6 +239,26 @@ func activeProfileLocks(workdir string) ([]string, error) {
 		return nil, err
 	}
 	return append(locks, instances...), nil
+}
+
+func activeProfileInstances(profile Profile) ([]profileInstance, error) {
+	root, err := profileRoot()
+	if err != nil {
+		return nil, err
+	}
+	lockDirs, err := activeProfileLocks(filepath.Join(root, profile.Name))
+	if err != nil {
+		return nil, err
+	}
+	instances := make([]profileInstance, 0, len(lockDirs))
+	for _, lockDir := range lockDirs {
+		pid, err := profileLockPID(lockDir)
+		if err != nil {
+			return nil, err
+		}
+		instances = append(instances, profileInstance{lockDir: lockDir, pid: pid})
+	}
+	return instances, nil
 }
 
 func profileRunningCount(profile Profile) int {

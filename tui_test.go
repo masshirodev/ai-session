@@ -1,9 +1,12 @@
 package main
 
 import (
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -157,6 +160,97 @@ func TestEditRefusesRunningProfile(t *testing.T) {
 	got := updated.(tuiModel)
 	if got.mode != tuiList || !strings.Contains(got.status, "cannot edit") {
 		t.Fatalf("running profile entered edit mode: mode=%v status=%q", got.mode, got.status)
+	}
+}
+
+func TestKillPickerListsEachRunningInstance(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("XDG_CONFIG_HOME", root)
+	profile := Profile{Name: "codex-work", Provider: "codex", Command: "codex"}
+	workdir := filepath.Join(root, appName, "profiles", profile.Name)
+	for _, name := range []string{"run-one", "run-two"} {
+		dir := filepath.Join(workdir, instancesDirectory, name)
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ".active.lock"), []byte("1\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	m := tuiModel{profiles: []Profile{profile}, width: 80}
+	updated, _ := m.updateList(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("K")})
+	got := updated.(tuiModel)
+	if got.mode != tuiConfirmKill || len(got.instances) != 2 {
+		t.Fatalf("kill picker = mode %v with %d instances", got.mode, len(got.instances))
+	}
+	view := got.View()
+	for _, want := range []string{"Instance 1 (PID 1)", "Instance 2 (PID 1)", "stops them all"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("kill picker is missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestTerminateProfileLockStopsOnlySelectedInstance(t *testing.T) {
+	first := exec.Command("sleep", "30")
+	if err := first.Start(); err != nil {
+		t.Fatal(err)
+	}
+	second := exec.Command("sleep", "30")
+	if err := second.Start(); err != nil {
+		_ = first.Process.Kill()
+		_ = first.Wait()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = first.Process.Kill()
+		_ = first.Wait()
+		_ = second.Process.Kill()
+		_ = second.Wait()
+	})
+
+	dir := t.TempDir()
+	firstDir := filepath.Join(dir, instancesDirectory, "run-one")
+	secondDir := filepath.Join(dir, instancesDirectory, "run-two")
+	for lockDir, command := range map[string]*exec.Cmd{firstDir: first, secondDir: second} {
+		if err := os.MkdirAll(lockDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		lock := fmt.Sprintf("%d\n%d\n", os.Getpid(), command.Process.Pid)
+		if err := os.WriteFile(filepath.Join(lockDir, ".active.lock"), []byte(lock), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := terminateProfileLock(firstDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Wait(); err == nil {
+		t.Fatal("selected instance did not stop")
+	}
+	if err := second.Process.Signal(syscall.Signal(0)); err != nil {
+		t.Fatalf("unselected instance was stopped: %v", err)
+	}
+}
+
+func TestChangeFolderUsesRelativeDirectory(t *testing.T) {
+	root := t.TempDir()
+	folder := filepath.Join(root, "project")
+	if err := os.Mkdir(folder, 0700); err != nil {
+		t.Fatal(err)
+	}
+	m := tuiModel{profiles: testProfiles(), workingDir: root}
+	updated, _ := m.updateList(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("c")})
+	got := updated.(tuiModel)
+	if got.mode != tuiFolder || got.folderPath != root {
+		t.Fatalf("change folder form = mode %v, value %q", got.mode, got.folderPath)
+	}
+	got.folderPath = "project"
+	updated, _ = got.updateFolder(tea.KeyMsg{Type: tea.KeyEnter})
+	got = updated.(tuiModel)
+	if got.mode != tuiList || got.workingDir != folder {
+		t.Fatalf("launch folder = mode %v, folder %q; want %q", got.mode, got.workingDir, folder)
 	}
 }
 
