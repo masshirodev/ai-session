@@ -211,3 +211,7 @@ In the TUI, select a running profile and press `K` to choose an individual CLI
 process by PID, or stop all of that profile's instances. Each lock records the
 launcher PID on its first line and the child CLI PID on its second line;
 orphaned locks can therefore be reclaimed after an interrupted SSH session.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
