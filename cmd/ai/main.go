@@ -122,14 +122,19 @@ func run(args []string, stdout, stderr io.Writer) error {
 		}
 		return launch(profile, args[2:], stdout, stderr)
 	case "login":
-		if len(args) != 2 {
-			return errors.New("usage: ai login <profile>")
+		if len(args) < 2 {
+			return errors.New("usage: ai login <profile> [command arguments...]")
 		}
 		profile, err := resolveProfile(cfg, args[1])
 		if err != nil {
 			return err
 		}
-		return launchExclusive(profile, loginArgs(profile.Provider), stdout, stderr)
+		// The login flow is run without the profile's default arguments, which
+		// are meant for a launch: a provider's own subcommand can reject a flag
+		// it puts before it — `opencode --auto auth login` parses as nothing at
+		// all — so anything extra is passed after the login arguments instead.
+		login := append(loginArgs(profile.Provider), args[2:]...)
+		return launchExclusive(profile, login, stdout, stderr)
 	case "update":
 		if len(args) != 2 {
 			return errors.New("usage: ai update <profile>")

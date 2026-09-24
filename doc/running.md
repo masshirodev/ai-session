@@ -51,6 +51,20 @@ ai login antigravity-personal
 ai login opencode-go
 ```
 
+Anything after the profile name is passed to the provider's login command after
+its own arguments, so a provider that can skip a picker is not forced through
+it. OpenCode takes the provider by id:
+
+```sh
+ai login opencode-go -p opencode-go
+```
+
+The login flow deliberately does not use the profile's default arguments (see
+[profiles](profiles.md)); those are meant for a launch, and a provider's own
+subcommand can reject one placed before it — `opencode --auto auth login` parses
+as nothing at all, which is why `ai login` is the way in rather than the generic
+passthrough.
+
 Update a profile's CLI with its supported updater:
 
 ```sh

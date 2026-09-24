@@ -51,6 +51,34 @@ func TestBareProfileInvocationUsesProfileAndArguments(t *testing.T) {
 	}
 }
 
+// The login flow must not carry the profile's default arguments: they are meant
+// for a launch, and a provider subcommand can reject one placed before it —
+// `opencode --auto auth login` parses as nothing at all. Anything extra goes
+// after the login arguments instead.
+func TestLoginCommandPassesExtraArgumentsWithoutDefaultArgs(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	path, err := configPath()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := saveConfig(path, Config{Profiles: []Profile{{
+		Name:        "oc",
+		Provider:    "opencode",
+		Command:     "/bin/echo",
+		DefaultArgs: []string{"--auto"},
+	}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr strings.Builder
+	if err := run([]string{"login", "oc", "-p", "opencode-go"}, &stdout, &stderr); err != nil {
+		t.Fatal(err)
+	}
+	if stdout.String() != "auth login -p opencode-go\n" {
+		t.Fatalf("login output = %q, want the login arguments then the extra ones, no --auto", stdout.String())
+	}
+}
+
 func TestUpdateCommandRunsProviderUpdater(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
 	path, err := configPath()
